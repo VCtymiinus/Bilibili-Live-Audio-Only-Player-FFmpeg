@@ -32,6 +32,7 @@ python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
 产物在 `tools/`。如果你已经有 ffplay，用环境变量 `BILILIVE_FFPLAY` 指向它即可，跳过上面两步。
 
 **免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
+**桌面版**；“bililive-1.3-win64” 是一个有前端的版本
 
 ## 使用
 

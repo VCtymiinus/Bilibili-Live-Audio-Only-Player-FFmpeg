@@ -1,0 +1,23 @@
+# bililive 运行依赖
+#
+# 好消息：程序本身**只用 Python 标准库**，没有任何第三方包依赖。
+# 这个文件存在的意义是记录「不需要装什么」，而不是让你 pip install。
+#
+# 验证过的事实：
+#   * HTTP 请求用 urllib.request（标准库）
+#   * JSON 用 json，gzip/deflate 解压用 gzip/zlib（标准库）
+#   * 子进程管理用 subprocess（标准库）
+#   * Windows API（Job Object / waveOut）用 ctypes（标准库）
+#   * TLS 用 ssl（标准库，走 OpenSSL）
+#
+# 唯一的「外部程序」依赖是 ffplay.exe，它不是 Python 包：
+#   它已经随发行包一起提供，放在与 start.bat 同一层。
+#   若要自行获取，见 probe/fetch_ffmpeg.py。
+#
+# 开发/验证时才需要的东西（发行包不需要）：
+#   * ffmpeg.exe  —— 仅 probe/ 下的流量测量与离线解码测试会用到
+#   * PyInstaller —— 曾尝试打包 exe，后放弃（见 README「关于 exe」）
+#
+# Python 版本要求：>= 3.8
+#   用到了 f-string、dataclasses、typing 的 `X | None` 写法（3.10+ 语法，
+#   但文件顶部都有 `from __future__ import annotations`，所以 3.8 也能跑）。

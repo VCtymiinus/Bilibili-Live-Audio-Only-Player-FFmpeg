@@ -193,6 +193,9 @@ class _Slider(tk.Canvas):
 class Overlay:
     """主窗口 + 迷你悬浮窗,两副面孔同一个 Tk 根窗口。"""
 
+    # ---- 固定尺寸（用户要求：不要自适应，以左列为基准）----
+    LEFT_W = 460           # 左列（播放控制）固定宽度
+    MIN_H = 560            # 主窗口最小高度；实际取「左列换行后需要的高度」
     # ---- 封面图相关常量 ----
     COVER_MAIN = 96        # 主界面封面边长
     COVER_CARD = 44        # 收藏卡片封面边长
@@ -417,20 +420,30 @@ class Overlay:
 
         # ---- 主体：左（播放控制）+ 右（收藏列表）----
         # 用两列而不是单列：收藏是「边看边点」的东西，放右侧不打断左侧操作。
-        # 左列要 fill/expand，右列固定宽（否则收藏卡片会被拉变形）。
+        #
+        # *** 左列宽度钉死，这是整个窗口尺寸的基准 ***
+        # 原来左列是 fill+expand，宽度随窗口走 —— 那就没有"基准"可言。
+        # 现在左列固定 LEFT_W，右列吃掉剩余空间，窗口总宽固定，
+        # 内容变化只在列内消化（文字换行、收藏栏滚动）。
         body = tk.Frame(self.full, bg=_BG)
         body.pack(fill="both", expand=True)
         self._body = body
 
-        col = tk.Frame(body, bg=_BG)
-        col.pack(side="left", fill="both", expand=True)
+        col = tk.Frame(body, bg=_BG, width=self.LEFT_W)
+        col.pack(side="left", fill="both")
+        # 关掉尺寸传播：不关的话左列会被内容撑宽（长标题、长状态文字），
+        # 基准就守不住了。关掉之后宽度严格等于 LEFT_W。
+        col.pack_propagate(False)
         self._main_col = col
+
+        # 窗口本身也不允许拖拽缩放 —— 固定尺寸的意图要贯彻到底
+        self.win.resizable(False, False)
 
         tk.Frame(body, bg=_LINE, width=1).pack(side="left", fill="y",
                                               padx=(6, 0))
 
         side = tk.Frame(body, bg=_BG, width=self._SIDE_W)
-        side.pack(side="left", fill="y", padx=(0, 0))
+        side.pack(side="left", fill="both", expand=True)
         side.pack_propagate(False)      # 保持固定宽度，不被内容撑开
         self._side = side
         self._build_bookmarks(side)
@@ -1212,44 +1225,82 @@ class Overlay:
                            kind="offline", ms=3200)
 
     def _center_full(self, reposition: bool = True) -> None:
-        """按内容定尺寸并居中。
+        """把主窗口摆成**固定尺寸**并居中。
 
-        reposition=False 时只调高度、不动位置 —— 用于「连上之后主播信息
-        出现」这种运行中长高的场景，避免窗口自己跳一下。
+        *** 尺寸固定，不再按内容自适应 ***
+        原来这里是按内容算的（`max(winfo_reqwidth(), 440)` /
+        `max(winfo_reqheight(), 330)`），结果是窗口会随着内容变来变去：
+        主播信息出现时长高、消失时缩回、提示弹出时又长高。
+        用户明确要求固定大小、以左列为基准。
+
+        现在宽度 = 左列固定宽 + 分隔线 + 收藏栏固定宽，
+        高度也是固定的，内容变化一律靠**内部滚动/换行**消化，
+        窗口本身不动。好处是界面不会"跳"，用户也不用每次都重新找位置。
+
+        reposition=False 仍然保留（调用方语义上表示"别挪位置"），
+        但因为尺寸已经固定，实际上不会再改变几何 —— 只有 reposition=True
+        时才重新居中。
         """
-        self.full.pack(fill="both", expand=True)
-        self.win.update_idletasks()
-        w = max(self.win.winfo_reqwidth(), 440)
-        # 先按宽度算换行，再问高度 —— 否则文字换行后的高度没算进去，
-        # 窗口会矮一截把底部按钮裁掉。
-        self._apply_wraplengths(w)
-        self.win.update_idletasks()
-        h = max(self.win.winfo_reqheight(), 330)
+        if not reposition:
+            return
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        if reposition:
-            x, y = (sw - w) // 2, max(0, (sh - h) // 2 - 40)
-        else:
-            x, y = self.win.winfo_x(), self.win.winfo_y()
+        w, h = self._full_size()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2 - 40)
         self.win.geometry(f"{w}x{h}+{x}+{y}")
 
-        if reposition:
-            # *** 必须再设一次，而且中间要 update() ***
-            # 这不是保险，是必需的。实测（逐行打印出来的）：
-            #     设完 geometry       geom='260x130+633+256'  位置已写入
-            #     update() 之后        pos=(1435,12) 440x367   位置被系统改回右上角
-            #     再设一次 + update    pos=(633,256) 440x367   这才生效
-            # 原因：切换 overrideredirect 时 Tk 会**销毁并重建包装窗口**，
-            # Windows 在重建时用默认位置覆盖刚设的坐标（尺寸保住了、位置被冲掉）。
-            # 所以要在窗口真正映射之后重新设一遍。
-            # 只调一次的话，从悬浮窗展开回主界面会停在右上角 —— 用户报的就是这个。
-            # update() 在窗口正在销毁时会抛 TclError，所以包一层；
-            # 真抛了也不该让整个切换流程断掉（窗口至少还有正确的尺寸）。
-            try:
-                self.win.update()
-                self.win.geometry(f"{w}x{h}+{x}+{y}")
-            except Exception:
-                pass
-            self._reset_drag()
+        # *** 必须再设一次，而且中间要 update() ***
+        # 这不是保险，是必需的。实测（逐行打印出来的）：
+        #     设完 geometry       geom='260x130+633+256'  位置已写入
+        #     update() 之后        pos=(1435,12) 440x367   位置被系统改回右上角
+        #     再设一次 + update    pos=(633,256) 440x367   这才生效
+        # 原因：切换 overrideredirect 时 Tk 会**销毁并重建包装窗口**，
+        # Windows 在重建时用默认位置覆盖刚设的坐标（尺寸保住了、位置被冲掉）。
+        # 所以要在窗口真正映射之后重新设一遍。
+        # 只调一次的话，从悬浮窗展开回主界面会停在右上角 —— 用户报的就是这个。
+        # update() 在窗口正在销毁时会抛 TclError，所以包一层。
+        try:
+            self.win.update()
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+        self._reset_drag()
+
+    def _full_size(self) -> tuple:
+        """主窗口的固定尺寸 (宽, 高)。以左列为基准算出来。
+
+        高度按「左列按固定宽度换行后需要多高」定，这样最长的那条状态文字
+        也能完整显示；主播信息块和提示卡片出现时不会再撑高窗口。
+        """
+        # 先按左列固定宽度设好换行宽度，再量需要多高 —— 顺序反了会算矮
+        self._apply_wraplengths(self.LEFT_W + self._SIDE_W + 7)
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
+        try:
+            need = self.win.winfo_reqheight()
+        except Exception:
+            need = 0
+        h = max(self.MIN_H, int(need) if need else self.MIN_H)
+        return (self.LEFT_W + 7 + self._SIDE_W, h)
+
+    def _relayout(self) -> None:
+        """内容变了之后重新安排内部布局（**不改变窗口尺寸**）。
+
+        原来这些地方是调 _center_full(reposition=False) 让窗口长高/缩回，
+        现在窗口固定，只要让内部重新计算即可。
+
+        *** main 列用 grid 而不是 pack ***
+        窗口高度固定之后，pack 从顶部堆叠会在内容变多时把底部按钮**挤出
+        可视区**（实测：主播信息出现后「重新连接」那一行看不见了）。
+        grid 里把 status/按钮行放在会伸缩的那一行下面，内容变多时按钮
+        始终贴底，不会被挤出去。
+        """
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 迷你悬浮窗
 
@@ -1772,7 +1823,7 @@ class Overlay:
             self._toast_card.pack(fill="x", padx=18, pady=(10, 0), side="top")
         self._toast_card.lift()
         # 卡片占了空间，窗口要长高一点，否则会挤掉底部按钮
-        self._center_full(reposition=False)
+        self._relayout()
         if self._toast_job is not None:
             try:
                 self.win.after_cancel(self._toast_job)
@@ -1787,7 +1838,7 @@ class Overlay:
         except Exception:
             pass
         # 收掉卡片后把窗口高度收回来
-        self._center_full(reposition=False)
+        self._relayout()
 
     def hide_toast(self) -> None:
         """立刻收掉提示卡片，并取消它自己的计时器。
@@ -1809,7 +1860,7 @@ class Overlay:
         try:
             if self._toast_card.winfo_ismapped():
                 self._toast_card.pack_forget()
-                self._center_full(reposition=False)
+                self._relayout()
         except Exception:
             pass
 
@@ -1862,7 +1913,7 @@ class Overlay:
             if self.meta.winfo_ismapped():
                 self.meta.pack_forget()
                 # 撤掉那一块后窗口要重新收一下高度
-                self._center_full(reposition=False)
+                self._relayout()
             return
 
         # 有房间就一定有内容可显示。取不到主播名就用房间号兜底 ——
@@ -1887,7 +1938,7 @@ class Overlay:
             # *** 出现新内容后必须重新调一次尺寸 ***
             # 否则窗口高度还是旧的，多出来的文字会把底部按钮挤出去（实测踩过：
             # 状态文字叠在「开始收听」上）。reposition=False 保持窗口不跳。
-            self._center_full(reposition=False)
+            self._relayout()
         if anchor:
             # 迷你窗标题也带上主播名，同时开多个房间时好区分
             self.lbl_mini.config(text=f"bililive  {anchor}")

@@ -213,6 +213,8 @@ class Overlay:
         self._last_anchor = None
         self._last_title = None
         self._last_cover = None
+        # 上一次「有没有房间」的状态，用来决定那块信息（含黄星）显不显示
+        self._last_has_room = None
         self._started = False
         # 当前正在听的房间号（用来判断用户是不是换了房间）
         self._room_now = None
@@ -1509,6 +1511,9 @@ class Overlay:
         # 清掉上一个房间的痕迹，否则界面会短暂显示旧的主播名/标题
         self.control.anchor = ""
         self.control.title = ""
+        # 封面也要清：不清的话新房间会先显示上一个房间的封面，
+        # 直到元数据取回来才换掉（实测能看出明显的错帧）。
+        self.control.cover = ""
         self.control.playing = False
         if self.control.paused:
             self.control.resume()
@@ -1826,21 +1831,30 @@ class Overlay:
         anchor = (self.control.anchor or "").strip()
         title = (self.control.title or "").strip()
         cover = (self.control.cover or "").strip()
+        # *** 显示条件：只要「有一个在听/在等的房间」就显示 ***
+        # 不再要求元数据非空。
+        #
+        # 原来是在 anchor 和 title 都为空时整块隐藏，后果就是用户反馈的：
+        # 没开播的直播间取不到元数据（旧代码只在开播成功后才去取），
+        # 于是封面和收藏黄星都不出现 —— 用户「根本没有收藏的地方」。
+        # 而没开播恰恰是最想先收藏的时候（先把房间收起来等主播开播）。
+        #
+        # 现在：有房间号就显示这块，主播名/封面取不到就退回占位，黄星始终可用。
+        has_room = bool(self._room_now or self.control.room)
         if (anchor == self._last_anchor and title == self._last_title
-                and cover == self._last_cover):
+                and cover == self._last_cover
+                and has_room == self._last_has_room):
             return
         self._last_anchor, self._last_title = anchor, title
         self._last_cover = cover
+        self._last_has_room = has_room
         # 星标状态可能因为「换房间」而变化（新房间可能不在收藏里），
         # 所以跟着主播信息一起重画
         self._star_on = None
         self._draw_star()
 
-        if not anchor and not title:
-            # *** 没有信息时必须把旧的清掉 ***
-            # 换房间时 _start() 会把 anchor/title 清空，如果这里直接 return，
-            # 界面上残留的就是**上一个房间**的主播名和标题 ——
-            # 用户会以为没换成功。实测踩过：换台后仍显示旧主播名。
+        if not has_room:
+            # 一个房间都没有：清掉并收起这块
             self.lbl_anchor.config(text="")
             self.lbl_title.config(text="")
             self._cover_shown = None
@@ -1851,8 +1865,11 @@ class Overlay:
                 self._center_full(reposition=False)
             return
 
-        self.lbl_anchor.config(text=anchor or "（未取名）")
-        self.lbl_title.config(text=title or "")
+        # 有房间就一定有内容可显示。取不到主播名就用房间号兜底 ——
+        # 让用户看到「这个房间」，而不是一片空白。
+        rid = self._room_now or self.control.room
+        self.lbl_anchor.config(text=anchor or f"房间 {rid}")
+        self.lbl_title.config(text=title or "（还没取到直播间标题）")
         # 封面：只有 URL 变了才重新下载，否则每 200ms 轮询都会重下
         if cover and cover != self._cover_shown:
             self._cover_shown = cover

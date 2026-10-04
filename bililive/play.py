@@ -195,6 +195,55 @@ def _run_inner(room: int, volume: int, verbose: bool,
     cands: list = []
     meta_started = False
 
+    # ---- 主播名 / 标题 / 封面：开播与否都要取 ----
+    # *** 为什么提到外面，而不是只在开播成功后取 ***
+    # 用户反馈：没开播时想收藏这个直播间，却发现**没有收藏的地方**。
+    # 根因就在这里 —— 元数据只在「开播成功」那条路径上取，于是没开播时
+    # control.anchor / title / cover 一直是空的，界面因此把整块
+    # 「主播 + 封面 + 黄星」都隐藏了。而收藏恰恰最需要在这种时候能用
+    # （主播没播，先把房间收起来，等他开播）。
+    # 现在做成一个闭包，开播和没开播两条路径都会调它。
+    def _start_meta_fetch(room_id: int) -> None:
+        """后台取一次主播名/标题/封面。不阻塞播放，也不阻塞等待开播。"""
+        nonlocal title, uname, meta_started
+        if meta_started:
+            return
+        meta_started = True
+
+        def _fetch_meta():
+            nonlocal title, uname
+            try:
+                m = client.room_info(room_id)
+                # 新接口（getRoomBaseInfo）把 title / uname 平铺在同一层。
+                # 兼容两种形状：平铺的，或老接口那种嵌套的。
+                if "title" in m or "uname" in m:
+                    title = m.get("title") or ""
+                    uname = m.get("uname") or ""
+                else:
+                    ri = m.get("room_info") or {}
+                    ai = (m.get("anchor_info") or {}).get("base_info") or {}
+                    title = ri.get("title") or ""
+                    uname = ai.get("uname") or ""
+                # 同步给界面显示（用户要求连上后显示主播名和直播间名）。
+                # 这几个字段是界面轮询读取的，所以在这里赋值就够了。
+                control.anchor = uname
+                control.title = title
+                # 封面也要同步：主界面显示封面，收藏时把 URL 存进快照。
+                # 注意放在 if/else **外面** —— 两种返回形状都要用到它，
+                # 只写在其中一个分支里的话另一条路径就永远没有封面。
+                control.cover = m.get("cover") or ""
+                if title or uname:
+                    con.info(f"主播 {uname} | {title}")
+                else:
+                    # 取不到就明说，别让用户以为界面坏了
+                    con.info("（没取到主播名/直播间标题，界面不显示那一块）")
+            except Exception as e:
+                con.info(f"取房间信息失败（不影响播放）: "
+                         f"{type(e).__name__}: {e}")
+
+        threading.Thread(target=_fetch_meta, name="room-info",
+                         daemon=True).start()
+
     con.info(f"准备播放房间 {room}（Ctrl+C 退出）")
     _px = system_proxy_in_use()
     if _px:
@@ -313,6 +362,11 @@ def _run_inner(room: int, volume: int, verbose: bool,
             con.info("工具会每 30 秒自动检查一次，一开播就会开始播放。")
             con.info("现在可以直接关掉窗口，或按 Ctrl+C 退出。")
             _status("未开播，等待中 ...")
+            # *** 没开播也要取主播名/封面 ***
+            # 否则界面那块（含收藏黄星）不会出现，用户就「没有收藏的地方」——
+            # 而这恰恰是收藏最该可用的时候（主播没播，先把房间收起来）。
+            if room_id:
+                _start_meta_fetch(room_id)
             # 只在**新出现**的未开播房间上报一次。
             # 这个分支每 30 秒就会走一遍，如果每轮都报，提示会每 30 秒
             # 重新弹一次；而倒计时已经由上面那行状态文字显示了。
@@ -321,7 +375,8 @@ def _run_inner(room: int, volume: int, verbose: bool,
                 control.report_offline(
                     "这个直播间现在没有开播\n"
                     "房间号是对的，工具会每 30 秒查一次；"
-                    "也可以换一个正在播的房间号")
+                    "也可以换一个正在播的房间号\n"
+                    "（想先收藏的话，点左上角封面上的 ☆）")
             waited = 0.0
             while waited < 30.0 and not stop.is_set():
                 stop.wait(1.0)
@@ -332,42 +387,8 @@ def _run_inner(room: int, volume: int, verbose: bool,
 
         # 标题/主播名**不阻塞播放**：它只为显示，放到后台线程去取。
         # 早期版本在启动路径上同步等它（实测约 5 秒），属于不必要的等待。
-        if not meta_started:
-            meta_started = True
-
-            def _fetch_meta():
-                nonlocal title, uname
-                try:
-                    m = client.room_info(room_id)
-                    # 新接口（getRoomBaseInfo）把 title / uname 平铺在同一层。
-                    # 兼容两种形状：平铺的，或老接口那种嵌套的。
-                    if "title" in m or "uname" in m:
-                        title = m.get("title") or ""
-                        uname = m.get("uname") or ""
-                    else:
-                        ri = m.get("room_info") or {}
-                        ai = (m.get("anchor_info") or {}).get("base_info") or {}
-                        title = ri.get("title") or ""
-                        uname = ai.get("uname") or ""
-                    # 同步给界面显示（用户要求连上后显示主播名和直播间名）。
-                    # 这两个字段是界面轮询读取的，所以在这里赋值就够了。
-                    control.anchor = uname
-                    control.title = title
-                    # 封面也要同步：主界面显示封面，收藏时把 URL 存进快照。
-                    # 注意放在 if/else **外面** —— 两种返回形状都要用到它，
-                    # 只写在其中一个分支里的话另一条路径就永远没有封面。
-                    control.cover = m.get("cover") or ""
-                    if title or uname:
-                        con.info(f"主播 {uname} | {title}")
-                    else:
-                        # 取不到就明说，别让用户以为界面坏了
-                        con.info("（没取到主播名/直播间标题，界面不显示那一块）")
-                except Exception as e:
-                    con.info(f"取房间信息失败（不影响播放）: "
-                             f"{type(e).__name__}: {e}")
-
-            threading.Thread(target=_fetch_meta, name="room-info",
-                             daemon=True).start()
+        # 注意闭包内部有自己的 meta_started 守卫，重复调用是安全的。
+        _start_meta_fetch(room_id)
 
         # ---- 3. 从候选列表里取一条可用的流 ----
         # 关键（P0-2 修复）：候选列表必须被真正轮换使用。

@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import urllib.request
 from tkinter import ttk
 
@@ -235,6 +236,10 @@ class Overlay:
         self._bm_auto = False
         # 收藏卡片的控件，更新开播状态时按房间号找回来
         self._bm_cards: dict = {}
+        # 需要按真实宽度裁剪的文字标签，以及它们的原始文案。
+        # 用 id(lbl) 做键：标签是每次重建新建的，用弱引用没必要，重建时整体清空。
+        self._bm_fit_labels: list = []
+        self._bm_texts: dict = {}
         # 收藏面板当前是否只显示开播中的
         self._bm_only_live = False
         # 正在刷新开播状态（防重复点击）
@@ -653,7 +658,23 @@ class Overlay:
 
         for i, it in enumerate(items):
             self._make_bm_card(self._bm_inner, it, i // 2, i % 2)
+        # *** 两列必须等宽，而且必须能收缩 ***
+        # 不配 columnconfigure 的话，grid 的列宽完全由内容决定：
+        # 实测两列分别是 192 和 196（不等宽），总请求宽度 404，
+        # 而收藏栏只有 360 —— **第二列右边被裁掉 36px**，
+        # 用户看到的就是「并排两个直播间显示不全」。
+        # uniform 保证两列等宽，weight 让它们平分可用宽度，
+        # minsize 给一个下限免得窗口极窄时压成一条。
+        self._bm_inner.columnconfigure(0, weight=1, uniform="bm", minsize=110)
+        self._bm_inner.columnconfigure(1, weight=1, uniform="bm", minsize=110)
         self._bm_inner.update_idletasks()
+        # *** 布局出来之后再按真实宽度裁文字 ***
+        # 顺序很重要：此刻每个标签的 winfo_width 才是它在格子里的实际宽度。
+        # 先裁后布局的话拿到的宽度是错的（实测因此少显示一个字）。
+        for lbl in self._bm_fit_labels:
+            self._fit_label(lbl, self._bm_texts.get(id(lbl), lbl.cget("text")))
+        self._bm_fit_labels.clear()
+        self._bm_texts.clear()
         self._bm_canvas.configure(
             scrollregion=self._bm_canvas.bbox("all"))
 
@@ -718,6 +739,12 @@ class Overlay:
         live = self._live_of(item)
         card = tk.Frame(parent, bg=_CARD)
         card.grid(row=r, column=c, sticky="nsew", padx=(0, 8), pady=(0, 8))
+        # *** 关掉尺寸传播，宽度完全交给 grid 决定 ***
+        # 不关的话卡片会按内容「请求宽度」，而请求宽度会被长标题撑大：
+        # 实测两列 request 合计 448，收藏栏只有 360 —— 于是第二列被裁。
+        # 关掉之后列宽严格由 columnconfigure 的 weight/uniform 决定，
+        # 文字只能在自己的格子里被截断，不可能再把布局撑出去。
+        card.grid_propagate(False)
 
         top = tk.Frame(card, bg=_CARD)
         top.pack(fill="x", padx=8, pady=(8, 4))
@@ -741,17 +768,27 @@ class Overlay:
 
         txt = tk.Frame(top, bg=_CARD)
         txt.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        # 房间号单独一行、用次要色：它是精确标识，用户要拿去核对
-        tk.Label(txt, text=str(rid), bg=_CARD, fg=_ACCENT,
-                 font=(_UI_FONT, 8, "bold"), anchor="w").pack(anchor="w")
+        # *** 顺序：主播名在上，房间号在下 ***（用户明确要求）
+        # 主播名是「人」的标识，更常用来认；房间号是精确标识，放次要位置。
         uname = uname_raw or "（未知主播）"
-        lb_u = tk.Label(txt, text=self._clip(uname, 9), bg=_CARD, fg=_FG,
+        # 文字先用完整内容建好，等布局出来再用 _fit_label 按**真实可用宽度**
+        # 裁剪（见 _rebuild_bookmarks_ui 末尾）。在这里估算像素是不可靠的。
+        lb_u = tk.Label(txt, text=uname, bg=_CARD, fg=_FG,
                         font=(_UI_FONT, 9), anchor="w")
         lb_u.pack(anchor="w")
+        # 房间号是精确标识，放次要位置（用户要求主播名在上）
+        lb_id = tk.Label(txt, text=str(rid), bg=_CARD, fg=_ACCENT,
+                         font=(_UI_FONT, 8, "bold"), anchor="w")
+        lb_id.pack(anchor="w")
         title = (item.get("title") or "").strip() or "—"
-        lb_t = tk.Label(txt, text=self._clip(title, 11), bg=_CARD, fg=_FG_DIM,
+        lb_t = tk.Label(txt, text=title, bg=_CARD, fg=_FG_DIM,
                         font=(_UI_FONT, 8), anchor="w")
         lb_t.pack(anchor="w")
+        # 记下原始文案：重建/缩放时要重新裁（已裁过的不能再裁，否则越裁越短）
+        self._bm_texts[id(lb_u)] = uname
+        self._bm_texts[id(lb_t)] = title
+        self._bm_fit_labels.append(lb_u)
+        self._bm_fit_labels.append(lb_t)
 
         # 底部一行：开播状态文字
         if live == 1:
@@ -763,6 +800,15 @@ class Overlay:
         lb_s = tk.Label(card, text=stat, bg=_CARD, fg=sc,
                         font=(_UI_FONT, 8), anchor="w")
         lb_s.pack(anchor="w", padx=8, pady=(0, 8))
+
+        # *** 量出需要的高度，再把尺寸传播关掉 ***
+        # grid_propagate(False) 会让卡片高度也失去依据（变成 1px），
+        # 所以不能拍一个数字：先让它按内容算一次（这时还算得出来），
+        # 再锁定尺寸。宽度直接按两列平分的目标值给，与 grid 的列宽一致。
+        card.update_idletasks()
+        want_h = card.winfo_reqheight()
+        card.grid_propagate(False)
+        card.configure(width=self._bm_card_w() - 8, height=want_h)
 
         widgets = [card, top, cv, txt, lb_u, lb_t, lb_s]
         for w in widgets:
@@ -798,9 +844,87 @@ class Overlay:
             except Exception:
                 pass
 
+    def _bm_card_w(self) -> int:
+        """一张收藏卡片的可用宽度（两列平分收藏栏）。
+
+        减掉：两列之间的 8px 间距、右列右侧的 8px 内边距。
+        """
+        w = int(getattr(self._bm_canvas, "winfo_width", lambda: 0)() or 0)
+        if w <= 1:
+            w = self._SIDE_W - 12 - 8 - 8      # 还没布局出来时的估算
+        return max(110, (w - 8) // 2)
+
+    @staticmethod
+    def _fit(text: str, px: int, font) -> str:
+        """把文字裁到**真实像素宽度** px 以内，放不下就加省略号。
+
+        *** 为什么不用「字数」或「估算的 px/字」 ***
+        一开始我按「中文 9.5px/字」估算，实测真实值是 **13px/字**，
+        于是算出来放得下、实际却溢出被切（「七海Nana7mi」的「米」没了、
+        「...赛事官方账号」的「号」没了）。字体度量是字体自己的事，
+        猜不得 —— 这里直接用 Tk 字体的 measure() 量。
+        """
+        t = " ".join(str(text).split())
+        if px <= 0 or not t:
+            return t
+        try:
+            if font.measure(t) <= px:
+                return t
+            ell = "…"
+            ew = font.measure(ell)
+            # 二分找最长的可显示前缀
+            lo, hi, best = 0, len(t), 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if font.measure(t[:mid]) + ew <= px:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            return (t[:best] + ell) if best > 0 else ell
+        except Exception:
+            return t
+
+    def _fit_label(self, lbl, text: str) -> None:
+        """按标签**当前实际宽度**裁剪文字再塞进去。
+
+        必须用实际宽度，不能拿窗口宽度去算：实测卡片里文字起点在 x=60
+        （封面 44 + 左右内边距），能用的只有 104px 左右，
+        按窗口宽度算出来的可用量偏大，文字就会溢出被切。
+        """
+        try:
+            lbl.update_idletasks()
+            font = tkfont.Font(font=lbl.cget("font"))
+            px = lbl.winfo_width()
+            if px <= 1:
+                px = lbl.winfo_reqwidth()
+            # 留 2px 余量，避免刚好贴边被裁
+            lbl.config(text=self._fit(text, max(20, px - 2), font))
+        except Exception:
+            try:
+                lbl.config(text=text)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _clip_px(text: str, px: int) -> str:
+        """纯估算版（没有标签可用时的兜底）。真实场景请用 _fit_label。"""
+        t = " ".join(str(text).split())
+        if px <= 0:
+            return t
+        budget = px / 13.0          # 实测中文 13px/字
+        used, out = 0.0, []
+        for ch in t:
+            w = 1.0 if ord(ch) > 0x2E80 else 0.56
+            if used + w > budget:
+                return ("".join(out) + "…") if out else t[:1]
+            used += w
+            out.append(ch)
+        return t
+
     @staticmethod
     def _clip(text: str, n: int) -> str:
-        """截断长标题。用省略号而不是硬切，让用户知道后面还有内容。"""
+        """按字数截断。保留给不需要像素精度的场合。"""
         t = " ".join(str(text).split())
         return t if len(t) <= n else t[:n] + "…"
 

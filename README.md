@@ -35,8 +35,7 @@ python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
 
 ## **桌面版**:
 `bililive-portable-win64` 是一个有前端的版本,可以直接填入房间号使用，并且随意调整声音。同时这个版本不需要Python，它已经被打包进程序了。
-![Uploading DM8C12IX7VP)6YZDEX3X(@7.png…]()
-
+<img width="835" height="579" alt="DM8C12IX7VP)6YZDEX3X(@7" src="https://github.com/user-attachments/assets/33be3036-5dc8-4859-8064-7d76e1074555" />
 
 ## 使用
 

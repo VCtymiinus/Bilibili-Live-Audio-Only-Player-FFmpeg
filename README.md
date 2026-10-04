@@ -1,4 +1,4 @@
-# bililive
+# Bilibili Live Audio-Only Player — FFmpeg（完全dsh制作）
 
 只听 B 站直播声音的小工具。给定直播间号，在后台把直播音频放出来，不开浏览器、不拉视频轨。
 

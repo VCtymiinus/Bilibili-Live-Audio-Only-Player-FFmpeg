@@ -3,8 +3,8 @@
 只听 B 站直播声音的小工具。给定直播间号，在后台把直播音频放出来，不开浏览器、不拉视频轨。
 
 ```
-python -m bililive 26774400
-python -m bililive 26774400 --volume 60
+python -m bililive 房间号
+python -m bililive 房间号 --volume 60
 ```
 
 ## 目录
@@ -22,7 +22,7 @@ python -m bililive 26774400 --volume 60
 
 需要 Python 3.8 以上。程序只用标准库，没有第三方依赖。
 
-唯一的外部程序是 `ffplay.exe`，用仓库里的脚本获取：
+唯一的外部程序是 `ffplay.exe`，用仓库里的脚本获取，Releases文件里已包含ffplay：
 
 ```
 python probe/fetch_ffmpeg.py      # 下载静态 ffmpeg 包（含 ffplay / ffprobe）
@@ -31,7 +31,7 @@ python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
 
 产物在 `tools/`。如果你已经有 ffplay，用环境变量 `BILILIVE_FFPLAY` 指向它即可，跳过上面两步。
 
-**免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，整个文件夹拷到哪都能用，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
+**免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
 
 ## 使用
 
@@ -55,8 +55,6 @@ python -m bililive <房间号> [--volume 0-100] [-v]
 要更大的声音，用 Windows 音量合成器单独调 `ffplay.exe`，不影响其他程序。
 
 ## 挂机时的行为
-
-工具的设计目标是"挂着不用管"，下面是各种情况下它会怎么做。
 
 **流地址过期** —— 每条地址有效期约 1 小时。工具会在剩余 10 分钟时主动换新，不等它真的断掉。
 

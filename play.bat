@@ -59,7 +59,7 @@ if not exist "%~dp0bililive_main.py" (
 
 if not exist "%~dp0tools\ffplay.exe" (
     echo [ERROR] tools\ffplay.exe not found.
-    echo         Run: python probe\extract_ffplay.py
+    echo         Run: python probe\fetch_ffmpeg.py
     goto :end
 )
 
@@ -90,7 +90,7 @@ if not "!RC!"=="0" (
     echo [ERROR] Exited with code !RC!
     echo.
     echo Common causes:
-    echo   * ffplay missing  -^> run: python probe\extract_ffplay.py
+    echo   * ffplay missing  -^> run: python probe\fetch_ffmpeg.py
     echo   * room number wrong, or streamer is offline
     echo   * cannot reach Bilibili API
 ) else (

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -18,6 +19,7 @@ import time
 
 from .biliapi import (BiliApiError, BiliLiveClient,  # noqa: E402
                       system_proxy_in_use)
+from .control import PlayerControl
 from .ffplay import FfplayPlayer, find_ffplay
 from .jobobject import JobObject
 
@@ -103,16 +105,33 @@ class Console:
         self._len = len(msg)
 
 
-def run(room: int, volume: int, verbose: bool) -> int:
+def run(room: int, volume: int, verbose: bool,
+        control: PlayerControl | None = None, on_status=None) -> int:
     from . import __version__
 
     con = Console(verbose)
     con.info(f"bililive v{__version__}  —— 只听哔哩哔哩直播的声音")
 
+    # control 由 main() 传进来（悬浮窗共享同一个对象）。直接调用 run() 时
+    # 自己造一个，这样命令行用法完全不受影响。
+    if control is None:
+        control = PlayerControl(volume=volume)
+    else:
+        control.set_volume(volume)
+
+    # 把状态同步给悬浮窗。on_status 可能为 None（纯命令行），所以统一走包装。
+    def _status(text: str) -> None:
+        control.status_text = text
+        if on_status is not None:
+            try:
+                on_status(text)
+            except Exception:
+                pass
+
     ffplay = find_ffplay()
     if not ffplay:
         con.info("!! 找不到 ffplay")
-        con.info("   运行 python probe/extract_ffplay.py 从已下载的包里解出，")
+        con.info("   运行 python probe/fetch_ffmpeg.py 下载并解出 ffplay.exe，")
         con.info("   或设置 BILILIVE_FFPLAY 环境变量")
         return 2
     con.info(f"ffplay = {ffplay}")
@@ -130,11 +149,16 @@ def run(room: int, volume: int, verbose: bool) -> int:
         con.debug("Job Object 不可用，退化为普通子进程管理")
 
     player = FfplayPlayer(ffplay, volume=volume, log=con.debug, job=job)
+    # 让播放器每次启动时现取音量，而不是用构造时的固定值。
+    # 悬浮窗拖完滑块后，播放循环重启 ffplay 时就会自动带上新音量。
+    player.set_volume_source(lambda: control.volume)
 
-    stop = threading.Event()
+    # 统一的退出标志。用 control 上的那个，这样悬浮窗的「关闭」和
+    # 命令行的 Ctrl+C 走的是同一条路径，不会出现两套退出逻辑打架。
+    stop = control.stop_event
 
     def on_sigint(_s, _f):
-        stop.set()
+        control.request_stop()
 
     try:
         signal.signal(signal.SIGINT, on_sigint)
@@ -156,7 +180,36 @@ def run(room: int, volume: int, verbose: bool) -> int:
     if _px:
         con.debug(f"检测到系统代理 {_px}：API 优先直连，失败才回退代理")
 
-    while not stop.is_set():
+    while not control.stop_requested:
+        # 每轮开头都先声明「没在播」。这样一旦流断了、地址过期了、
+        # 正在重连，界面立刻就知道该显示连接中 —— 而不会停在「播放中」
+        # 让用户以为还在放（我们为此得到过「明明断了却显示正在播放」的反馈）。
+        control.playing = False
+
+        # ---- 0. 暂停闸门 ----
+        # 用户按了暂停就停在这里。ffplay 已经在监控循环里关掉了（声音立刻停）。
+        #
+        # 等待方式刻意用「**只等 stop_event，然后重新读 paused**」，
+        # 而不是「等 resume_event」：
+        #   * paused 是界面线程写的普通属性，轮询它最简单，不需要
+        #     在两个 Event 之间做二选一（那种写法容易出现
+        #     「暂停中关窗口，线程等错了 Event 就永远不退出」）。
+        #   * stop_event.wait 能在关窗口时**立刻**醒来，不用等满 0.2 秒。
+        if control.paused:
+            _status("已暂停")
+            con.info("已暂停（点悬浮窗的播放键继续，继续后从当下接着听）")
+            # 每 0.2 秒醒一次重新读 control.paused；用 stop_event.wait 而不是
+            # time.sleep，是为了关窗口时能立刻退出，不用等这 0.2 秒。
+            while control.paused and not control.stop_requested:
+                control.stop_event.wait(0.2)
+            if control.stop_requested:
+                break
+            # 继续：候选地址可能已经放了很久，丢掉重新取，
+            # 避免拿一条已经过期的地址去连。
+            cands = []
+            con.info("继续播放，重新取一条地址 ...")
+            _status("正在继续 ...")
+            continue
         # ---- 1. 解析房间 + 并行预热 buvid ----
         # 首播延迟优化点：
         #   (a) resolve_room 的返回里**已经带了 live_status**，早期版本之后
@@ -241,14 +294,28 @@ def run(room: int, volume: int, verbose: bool) -> int:
                 nonlocal title, uname
                 try:
                     m = client.room_info(room_id)
-                    ri = m.get("room_info") or {}
-                    ai = (m.get("anchor_info") or {}).get("base_info") or {}
-                    title = ri.get("title") or ""
-                    uname = ai.get("uname") or ""
+                    # 新接口（getRoomBaseInfo）把 title / uname 平铺在同一层。
+                    # 兼容两种形状：平铺的，或老接口那种嵌套的。
+                    if "title" in m or "uname" in m:
+                        title = m.get("title") or ""
+                        uname = m.get("uname") or ""
+                    else:
+                        ri = m.get("room_info") or {}
+                        ai = (m.get("anchor_info") or {}).get("base_info") or {}
+                        title = ri.get("title") or ""
+                        uname = ai.get("uname") or ""
+                    # 同步给界面显示（用户要求连上后显示主播名和直播间名）。
+                    # 这两个字段是界面轮询读取的，所以在这里赋值就够了。
+                    control.anchor = uname
+                    control.title = title
                     if title or uname:
                         con.info(f"主播 {uname} | {title}")
-                except Exception:
-                    pass
+                    else:
+                        # 取不到就明说，别让用户以为界面坏了
+                        con.info("（没取到主播名/直播间标题，界面不显示那一块）")
+                except Exception as e:
+                    con.info(f"取房间信息失败（不影响播放）: "
+                             f"{type(e).__name__}: {e}")
 
             threading.Thread(target=_fetch_meta, name="room-info",
                              daemon=True).start()
@@ -345,6 +412,21 @@ def run(room: int, volume: int, verbose: bool) -> int:
             continue
 
         play_sessions += 1
+        # 记录 ffplay 实际用上的音量，供悬浮窗判断「滑块和实际是否一致」
+        control.applied_volume = control.volume
+        # *** 先清掉「正在连接/正在继续」，再置 playing ***
+        # 顺序很重要：界面每次轮询都按 (playing, status_text) 重算按钮。
+        # 如果 status_text 还停在「正在继续 ...」而 playing 已经变 True，
+        # 界面就会短暂显示「已经在播」这个组合 —— 实测每次恢复都有约
+        # 0.2 秒的自相矛盾窗口。先把状态文字改成「缓冲中 ...」，
+        # 按钮就会走「开始过但还没在播」那一支，等 playing 置上后再变
+        # 「正在播放」，全程只出现合理的中间态。
+        _status("缓冲中 ...")
+        control.playing = True
+        # 开始计时。用 control 这一层的累计时长，**不用 ffplay 的存活时间** ——
+        # 调音量和地址续期都会重启 ffplay，进程存活时间会归零，
+        # 用户就会看到「一调音量计时器就回到 0」（实测确认过这个 bug）。
+        control.start_timer()
         deadline = (stream.expires_at - RENEW_MARGIN
                     if stream.expires_at else time.time() + 3000)
         # 兜底：即使解析不到 expires，也不要无限播放同一条 URL
@@ -352,20 +434,79 @@ def run(room: int, volume: int, verbose: bool) -> int:
             deadline = time.time() + 3000
 
         expired = False
-        while not stop.is_set():
-            time.sleep(0.5)
+        # 暂停也要能从这个循环里出来，所以两个条件一起看。
+        # 用 paused_now 单独记一笔：暂停和「播完了」必须区分开，
+        # 否则暂停会被当成 ffplay 异常退出，白白触发一次退避重连。
+        paused_now = False
+        volume_changed = False
+        while not control.stop_requested:
+            # *** 这里不能用 time.sleep(0.5) ***
+            # 用 stop_event.wait 才能「暂停一按下就立刻醒」。
+            # 用 sleep 的话，用户按下暂停后最多要等 0.5 秒循环才走到判断，
+            # 加上杀掉 ffplay 的时间，手感明显发钝。
+            # 实测：sleep(0.5) 时暂停延迟约 0.5~1.0 秒。
+            control.stop_event.wait(0.5)
+            # 悬浮窗调了音量：ffplay 不支持运行中改音量，只能重启一次。
+            # 放在这里检测而不是让界面直接重启 —— 界面上做这个会卡住 UI，
+            # 而且会和播放循环抢同一个进程句柄。
+            if control.applied_volume != control.volume:
+                volume_changed = True
+                break
+            if control.paused:
+                paused_now = True
+                break
             if not player.is_alive():
                 break
             if time.time() > deadline:
                 expired = True
                 con.info("音频地址接近过期，主动换新")
                 break
-            con.status(f"  播放中 {player.uptime/60:5.1f} 分钟  "
+            mins = control.elapsed_minutes
+            control.playing = True
+            con.status(f"  播放中 {mins:5.1f} 分钟  "
                        f"累计 {play_sessions} 次连接  "
                        f"候选剩 {len(cands)}  host="
                        f"{stream.url.split('/')[2][:26]}")
+            _status(f"播放中 {mins:.1f} 分钟")
 
-        if stop.is_set():
+        if volume_changed:
+            # 重启 ffplay 以套用新音量。URL 还是同一条（还有效，没必要换），
+            # 所以这里不算一次「故障」，不退避、也不消耗候选。
+            # 代价：会有约 1~3 秒断音，这是为了「只用本工具的音量、
+            # 不动系统总音量」而付的代价，已经和用户说明过。
+            #
+            # 状态文字要明确写「正在应用音量」而不是留给界面显示旧状态：
+            # 重启期间界面不该再显示「播放中」，否则用户会以为卡住了。
+            _status("正在应用音量 ...")
+            con.info(f"音量改为 {control.volume}，重新启动播放（会短暂断一下）")
+            player.stop()
+            # 计时**不停**：这是我们自己为了调音量重启，不是用户暂停，
+            # 累计时长必须连续（否则用户看到的就是「一调音量计时归零」）。
+            try:
+                player.start(stream.url, client.headers())
+            except Exception as e:
+                con.info(f"重启 ffplay 失败: {type(e).__name__}: {e}")
+                control.stop_timer()
+                stop.wait(backoff)
+                backoff = min(backoff * 2, BACKOFF_MAX)
+                continue
+            control.applied_volume = control.volume
+            # 新一轮监控循环会立刻把状态刷回「播放中 X 分钟」
+            continue
+
+        if paused_now:
+            # 暂停：把 ffplay 关掉，声音立刻停。
+            # 这里**不要**去读 exit_code / had_error，也不要走下面的
+            # 退出原因判定 —— 是我们自己杀掉的，那套逻辑毫无意义，
+            # 而且会把「正常暂停」判成「连接失败」并触发退避。
+            player.stop()
+            # 暂停不计时：继续之后从原来的累计值接着涨，
+            # 而不是把暂停的那段时间也算进去（那会像是在偷跑）。
+            control.stop_timer()
+            con.info("已暂停，声音已停止")
+            continue
+
+        if control.stop_requested:
             break
 
         # ---- 5. 判断退出原因，决定退避还是立刻换下一条 ----
@@ -421,6 +562,7 @@ def run(room: int, volume: int, verbose: bool) -> int:
 
     print()
     con.info("停止中 ...")
+    control.stop_timer()
     player.stop()
     # 兜底：job 里若还有残留（比如 ffplay 又拉起了子进程），一并清掉
     job.terminate_all()
@@ -428,6 +570,71 @@ def run(room: int, volume: int, verbose: bool) -> int:
     con.info(f"已停止。累计播放 {play_sessions} 次连接，"
              f"总时长 {(time.time()-started)/60:.1f} 分钟")
     return 0
+
+
+def _has_console() -> bool:
+    """当前进程有没有一个真正的控制台窗口？
+
+    为什么不能直接用 sys.stdout.isatty()：
+        * PyInstaller 的 --windowed 打包后 sys.stdout 是 None（见
+          bililive_main.py 的处理），isatty 无从谈起。
+        * 被重定向到文件时 isatty() 也是 False，但那时**有**控制台，
+          只是输出被接走了。
+    所以直接问 Windows：本进程挂着几个控制台窗口。0 就是没有。
+    非 Windows 一律当作「有」（走控制台路径，行为最保守）。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetConsoleWindow() != 0
+    except Exception:
+        return False
+
+
+def _ask_room_console() -> int | None:
+    """在控制台里问房间号。拿不到就返回 None。
+
+    只在「命令行没给房间号、又明确不要界面」时用得上
+    （--no-gui，或者输出被重定向到文件）。
+    有界面的情况一律交给主窗口去问 —— 那比弹一个单行对话框自然得多。
+
+    *** 必须防 sys.stdin 为 None ***
+    PyInstaller --windowed 打包后 sys.stdin 就是 None，此时 input() 会抛
+        RuntimeError: input(): lost sys.stdin
+    而不是返回空串。实测因此崩过一个交付版，所以这里三重保护：
+    先查 None，再查 isatty，最后 try/except 整个 input。
+    """
+    if sys.stdin is None:
+        return None
+    try:
+        if not sys.stdin.isatty():
+            # 不是交互式终端（被重定向/管道），问也问不出来
+            return None
+    except Exception:
+        return None
+    try:
+        sys.stdout.write("请输入直播间房间号（地址栏 live.bilibili.com/ 后面那串数字）：")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        raw = input().strip()
+    except (EOFError, KeyboardInterrupt, RuntimeError, OSError, ValueError):
+        return None
+    return _parse_room(raw)
+
+
+def _parse_room(raw: str) -> int | None:
+    """把用户输入变成房间号。容忍直接粘整条网址。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return int(digits) if digits else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -455,13 +662,100 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--volume", type=int, default=100,
                    help="音量 0-100，0=静音 100=最大（默认 100，超范围会被夹紧）")
     p.add_argument("-v", "--verbose", action="store_true", help="详细日志")
+    p.add_argument("--gui", action="store_true",
+                   help="强制显示悬浮窗（暂停/继续、调音量）")
+    p.add_argument("--no-gui", action="store_true",
+                   help="不显示悬浮窗，只用命令行")
     p.add_argument("--version", action="version",
                    version=f"bililive {__version__}")
     args = p.parse_args(argv)
-    if args.room is None:
-        p.print_help()
-        return 1
-    return run(args.room, args.volume, args.verbose)
+
+    if args.gui and args.no_gui:
+        p.error("--gui 和 --no-gui 不能同时用")
+
+    # ---- 拿房间号 ----
+    #
+    # *** 这里踩过一个严重的坑，改之前务必读完 ***
+    # 打包成 --windowed（无控制台）后，如果**双击**运行，用户根本没地方
+    # 输入房间号。而原来的代码在这种情况下是 `p.print_help(); return 1`
+    # —— 在无控制台的窗口版里，print_help 的输出**无处可去**，
+    # 于是进程一秒内静默退出，用户看到的就是「双击什么都没发生」。
+    #
+    # 所以按运行环境分情况：
+    #   命令行给了房间号  -> 直接用
+    #   没给 + 要显示界面 -> **交给界面去问**（主窗口里输入，最自然）
+    #   没给 + 不要界面   -> 在控制台里问
+    room = args.room
+
+    # 要不要显示界面？判定规则（默认显示）：
+    #   --no-gui / BILILIVE_NO_GUI  -> 不要
+    #   --gui                       -> 一定要
+    #   没有控制台（打包版双击）    -> 一定要（否则用户没有任何界面可用）
+    #   有控制台但输出被重定向      -> 不要（脚本在跑，弹窗口会挂着等）
+    #   其余                        -> 显示
+    #
+    # *** 这个判定必须看「有没有控制台」，不能看 sys.stdout.isatty() ***
+    # 踩过两次，都是同一个根因：
+    #   * PyInstaller --windowed 打包后 sys.stdout 是 None，isatty() 无从谈起；
+    #   * 即使补了个假 stdout，isatty() 也是 False。
+    # 早期版本把它当成「不要界面」，于是打包版双击后既不显示窗口，
+    # 又转去问控制台（input()），在 stdin 为 None 时直接
+    # RuntimeError: input(): lost sys.stdin 崩掉。
+    # 正确问法是问 Windows：本进程到底挂着几个控制台窗口。
+    has_console = _has_console()
+    show_gui = True
+    if args.no_gui or os.environ.get("BILILIVE_NO_GUI"):
+        show_gui = False
+    elif not args.gui and has_console and sys.stdout is not None:
+        try:
+            if not sys.stdout.isatty():
+                show_gui = False      # 有控制台但输出被重定向 -> 脚本场景
+        except Exception:
+            pass
+
+    if not show_gui:
+        if room is None:
+            room = _ask_room_console()
+            if room is None:
+                # 拿不到房间号就别静默退出（windowed 版里用户什么都看不到）。
+                # 这里已经在「不要界面」的分支上，所以至少把用法打到 stdout。
+                p.print_help()
+                return 1
+        return run(room, args.volume, args.verbose)
+
+    # ---- 有界面的路径 ----
+    # 播放循环必须在后台线程：它是个几十小时的长循环，放主线程窗口会卡死。
+    # Tkinter 则**必须**在主线程（否则会随机崩），所以 mainloop 留在主线程。
+    #
+    # 注意：房间号可能是 None（双击 exe 就是这种）。这时**不**提前启动
+    # 播放线程，而是等用户在主窗口里填好、点了「开始收听」再启动
+    # （见 ui.py 的 _on_start）。这样界面先出来，用户有地方可操作。
+    from .ui import run_with_overlay
+    control = PlayerControl(volume=args.volume)
+    control.room = room
+
+    worker = None
+    if room is not None:
+        worker = threading.Thread(
+            target=run,
+            args=(room, args.volume, args.verbose, control),
+            name="play-loop",
+            daemon=True,          # 主窗口关了就别留着它
+        )
+        worker.start()
+
+    run_with_overlay(control, room=room)
+    # 窗口关闭后，确保播放线程也被要求退出（点 X 时已经设过一次，
+    # 这里再设一次是为了兜住「窗口因为别的原因消失」的情况）。
+    # ui.py 里用户点「开始收听」时可能自己起了一个线程，所以这里
+    # 不只 join 我们创建的那个，还要等一下界面起的那个。
+    control.request_stop()
+    if worker is not None:
+        worker.join(timeout=5.0)
+    for t in threading.enumerate():
+        if t.name == "play-loop" and t.is_alive():
+            t.join(timeout=3.0)
+    return 0
 
 
 if __name__ == "__main__":

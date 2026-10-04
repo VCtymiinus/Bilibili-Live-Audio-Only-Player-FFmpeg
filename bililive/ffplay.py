@@ -75,6 +75,12 @@ class FfplayPlayer:
                  log=None, extra_args: list[str] | None = None, job=None):
         self.ffplay = ffplay or find_ffplay()
         self.volume = max(0, min(100, volume))
+        # 悬浮窗调音量时，ffplay 不支持运行中改，只能在**重启时**用上新值。
+        # 所以允许调用方传一个「取当前音量」的可调用对象（通常是
+        # PlayerControl.volume），每次 start() 时现取一次。
+        # 这样滑块拖完 -> 播放循环重启 ffplay -> 新音量自动生效，
+        # 不需要播放循环额外维护一份音量副本（副本必然会不同步）。
+        self._volume_source = None
         self._log = log or (lambda m: None)
         self._proc: subprocess.Popen | None = None
         self._extra = list(extra_args or [])
@@ -91,6 +97,23 @@ class FfplayPlayer:
     def available(self) -> bool:
         return bool(self.ffplay)
 
+    def set_volume_source(self, source) -> None:
+        """设置「取当前音量」的可调用对象。每次 start() 时现取。
+
+        传 None 则退回到构造时的固定 self.volume。
+        悬浮窗调音量就靠这条通路生效：滑块改值 -> 播放循环重启 ffplay
+        -> _cmd() 现取到新音量 -> 写进 -volume。
+        """
+        self._volume_source = source
+
+    def _current_volume(self) -> int:
+        if self._volume_source is not None:
+            try:
+                return max(0, min(100, int(self._volume_source())))
+            except Exception:
+                pass
+        return self.volume
+
     def _cmd(self, url: str, headers: str) -> list[str]:
         args = [
             self.ffplay,
@@ -103,7 +126,7 @@ class FfplayPlayer:
             "-nodisp",            # 不开视频窗口
             "-vn",                # 丢弃视频流（我们只要声音）
             "-autoexit",          # 流结束就退出，让上层能感知
-            "-volume", str(self.volume),
+            "-volume", str(self._current_volume()),
             # 只保留 -infbuf。早期同时给了 -fflags nobuffer，
             # 但两者目标相反：nobuffer 意在少缓冲，-infbuf 取消输入缓冲上限。
             # 对冲的结果是直播延迟只增不减（抖动累积不自愈），

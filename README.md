@@ -25,11 +25,14 @@ python -m bililive 房间号 --volume 60
 唯一的外部程序是 `ffplay.exe`，用仓库里的脚本获取，Releases文件里已包含ffplay：
 
 ```
-python probe/fetch_ffmpeg.py      # 下载静态 ffmpeg 包（含 ffplay / ffprobe）
-python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
+python probe/fetch_ffmpeg.py      # 下载静态包，一次解出 ffmpeg.exe 和 ffplay.exe
 ```
 
-产物在 `tools/`。如果你已经有 ffplay，用环境变量 `BILILIVE_FFPLAY` 指向它即可，跳过上面两步。
+产物在 `tools/`。如果你已经有 ffplay，用环境变量 `BILILIVE_FFPLAY` 指向它即可，跳过这步。
+
+> 这里原本还有第二步 `python probe/extract_ffplay.py`，但那个文件在仓库里并不存在，
+> 照着做会直接报「找不到文件」。现在 `fetch_ffmpeg.py` 已经把 ffplay.exe 一起解出来，
+> 那一步不再需要。
 
 **免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
 

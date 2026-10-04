@@ -15,7 +15,17 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLS = os.path.join(ROOT, "tools")
-TARGET = os.path.join(TOOLS, "ffmpeg.exe")
+
+# 本脚本要解出**两个**程序：
+#   ffmpeg.exe —— 通用转码工具（probe/ 里的离线验证脚本用得上）
+#   ffplay.exe —— 本项目的播放器，**缺了它程序无法出声**
+#
+# *** 这里踩过一个坑，别只看 TARGET ***
+# 早期版本只找 "ffmpeg.exe"，然后 README 让用户再跑一步
+# `probe/extract_ffplay.py` 去解出 ffplay —— 而那个文件在仓库里根本不存在，
+# 于是「按文档拿播放器」这条路是断的。
+# 现在一次把两个都解出来，文档里那一步也就不需要了。
+TARGETS = ("ffmpeg.exe", "ffplay.exe")
 
 URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -48,9 +58,15 @@ def fetch_range(url, start, end, path, idx, progress, total, lock):
 
 
 def main():
-    if os.path.isfile(TARGET):
-        print(f"已存在 {TARGET}，跳过")
+    # 跳过判断看**两个**产物是否都已存在。
+    # 只看 ffmpeg.exe 是不够的：本项目要的是 ffplay.exe，
+    # 早先有 ffmpeg 就跳过，会导致 ffplay 永远拿不到。
+    existing = [w for w in TARGETS if os.path.isfile(os.path.join(TOOLS, w))]
+    if len(existing) == len(TARGETS):
+        print(f"已存在，跳过：{', '.join(existing)}")
         return 0
+    if existing:
+        print(f"已有 {', '.join(existing)}，继续补齐其余文件")
 
     size, ranges = head_size(URL)
     print(f"文件 {size/1048576:.1f} MB  Accept-Ranges={ranges}")
@@ -106,16 +122,30 @@ def fallback_single():
 
 
 def extract(data):
+    """从 zip 里解出 ffmpeg.exe 和 ffplay.exe 到 tools/。
+
+    逐个查找、各自独立成败：只要 ffplay 到位，本项目就能出声；
+    ffmpeg 缺失只影响 probe/ 里那些离线验证脚本，不该让整步失败。
+    """
     zf = zipfile.ZipFile(io.BytesIO(data))
-    names = [n for n in zf.namelist() if n.lower().endswith("ffmpeg.exe")]
-    if not names:
-        print("!! 包里没有 ffmpeg.exe")
-        return 1
-    name = sorted(names, key=len)[0]
     os.makedirs(TOOLS, exist_ok=True)
-    with zf.open(name) as src, open(TARGET, "wb") as dst:
-        dst.write(src.read())
-    print(f"OK -> {TARGET} ({os.path.getsize(TARGET)/1048576:.1f} MB)")
+    ok = False
+    for want in TARGETS:
+        names = [n for n in zf.namelist()
+                 if n.lower().endswith(want.lower())]
+        if not names:
+            print(f"!! 包里没有 {want}")
+            continue
+        name = sorted(names, key=len)[0]      # 取路径最短的那个
+        dst_path = os.path.join(TOOLS, want)
+        with zf.open(name) as src, open(dst_path, "wb") as dst:
+            dst.write(src.read())
+        print(f"OK -> {dst_path} ({os.path.getsize(dst_path)/1048576:.1f} MB)")
+        if want.lower() == "ffplay.exe":
+            ok = True
+    if not ok:
+        print("!! 关键文件 ffplay.exe 没有拿到，本项目无法播放")
+        return 1
     return 0
 
 

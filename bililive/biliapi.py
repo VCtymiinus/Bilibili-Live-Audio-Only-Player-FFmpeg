@@ -212,12 +212,34 @@ class BiliLiveClient:
         return r["data"]
 
     def room_info(self, room_id: int) -> dict:
-        """房间标题、主播、开播状态。失败只返回空 dict，不致命。"""
+        """房间标题、主播名、开播状态。失败只返回空 dict，不致命。
+
+        *** 这里换过接口，原因必看 ***
+        原来用的是 /xlive/web-room/v1/index/getInfoByRoom。实测（2026-10）
+        该接口**一律返回 code=-352**（B 站风控），即使带了合法的 buvid3、
+        带上 b_nut 时间戳也照样 -352，而其余接口（room_init、取流）都正常。
+        也就是说标题和主播名一直是取不到的，界面上那块永远不显示，
+        而且因为异常被吞掉，连个错都看不到。
+
+        现在改用 /xlive/web-room/v1/index/getRoomBaseInfo：
+            * 同一个请求里就带回 title 和 uname，不用再调主播接口；
+            * 实测 code=0 稳定可用，不需要登录、不需要 WBI 签名。
+
+        返回结构是 {"by_room_ids": {"<room_id>": {...}}}，仍然把那个内层
+        dict 直接返回，调用方不用关心外层包装。
+        """
         try:
-            r = self._api("/xlive/web-room/v1/index/getInfoByRoom",
-                          {"room_id": room_id})
+            r = self._api("/xlive/web-room/v1/index/getRoomBaseInfo",
+                          {"room_ids": str(room_id),
+                           "req_biz": "web_room_componet"})
             if r.get("code") == 0:
-                return r["data"]
+                by = ((r.get("data") or {}).get("by_room_ids") or {})
+                # 键是字符串形式的 room_id；取不到就退回第一个，容错更宽
+                info = by.get(str(room_id))
+                if info is None and by:
+                    info = next(iter(by.values()))
+                if info:
+                    return info
         except Exception:
             pass
         return {}
@@ -305,8 +327,6 @@ class BiliLiveClient:
             return None
         if len(candidates) == 1:
             return candidates[0]
-
-        import threading
 
         # 按 (format, protocol) 分层；candidates 已是排好序的，所以层的顺序
         # 天然继承原有优先级。

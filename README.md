@@ -33,6 +33,27 @@ python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
 
 **免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
 
+### v1.3 打包版（onedir，免 Python）
+
+`bililive-1.3-win64/` 是 v1.3 的 onedir 打包产物，**目标机器不需要装 Python**：
+
+```
+bililive-1.3-win64/
+    bililive.exe      主程序，双击运行
+    ffplay.exe        播放器（见下方说明）
+    _internal/        运行库，约 980 个文件
+    使用说明.txt       面向使用者的完整说明
+```
+
+**仓库里不含 `ffplay.exe`**：它单个 102 MB，超过 GitHub 单文件 100 MB 的硬限制，
+推不上去。请从本仓库 **Releases** 下载完整压缩包，或用上面 `probe/fetch_ffmpeg.py`
+取一个放进该目录根下（与 `bililive.exe` 并排，**不要**放进 `_internal/`）。
+
+与源码版的区别：源码版用 `start.bat` + 命令行交互；打包版是一个带界面的窗口，
+可输入房间号、暂停/继续、调音量，也能缩成右上角的小悬浮窗。想换房间就把房间号
+改掉，按钮会变成「换到该房间」，点它或按回车都行。详见
+`bililive-1.3-win64/使用说明.txt`。
+
 ## 使用
 
 ```

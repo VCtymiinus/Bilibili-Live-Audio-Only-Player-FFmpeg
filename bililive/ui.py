@@ -1274,6 +1274,12 @@ class Overlay:
         """
         if not reposition:
             return
+        # *** 必须先把 full 帧 pack 回去 ***
+        # 原来这行在按内容定尺寸的实现里，我改成固定尺寸时整段替换掉了，
+        # 结果 _to_full() 里 compact.pack_forget() 之后没人把 full 放回来 ——
+        # 从悬浮窗展开就是一片空白（用户报的正是这个）。
+        # 这里要放在居中之前：先有布局才量得到需要的尺寸。
+        self.full.pack(fill="both", expand=True)
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
         w, h = self._full_size()
         x = max(0, (sw - w) // 2)

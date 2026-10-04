@@ -195,6 +195,7 @@ class Overlay:
         # 悬浮提示的状态
         self._last_error_seq = 0
         self._last_offline_seq = 0
+        self._last_status_seq = 0
         self._toast_job = None
         # 是否正在「主动换房间」——用来区分「循环退出」是换台还是真结束，
         # 免得换台过程中误报「已停止」
@@ -811,11 +812,20 @@ class Overlay:
             if self._started:
                 self._started = False
                 self.control.playing = False
-                self._last_status = None
                 # 按钮文字由下面的状态机统一重算，这里不自己设
                 if not self._switch_in_progress:
                     # 不是「换房间」主动停的，说明这轮真的结束了
                     self._set_status("已停止。可以输入房间号重新开始。")
+                # 把「已处理到哪个状态序号」记下来。
+                #
+                # *** 这里绝不能写 _last_status = None ***
+                # 一开始我写的就是 None，结果下面那个刷新条件
+                # （status != self._last_status）**必然为真**，于是又把
+                # control 里残留的旧文本同步回标签，把刚设的「已停止」冲掉 ——
+                # 实测日志里就是连续两次 _set_status。
+                # 正确做法是承认「这个序号已经处理过了」，而不是把记录清空。
+                self._last_status = self.control.status_text
+                self._last_status_seq = self.control.status_seq
 
         paused = self.control.paused
         playing = self.control.playing
@@ -830,8 +840,16 @@ class Overlay:
         self._update_buttons(playing, paused)
 
         status = self.control.status_text or ""
-        if status != self._last_status:
+        # *** 只在循环真的写过新状态时才据此刷新 ***
+        # control.status_text 在循环退出后仍然是上一轮留下的文本。若不加这个
+        # 判断，上面刚设的「已停止」会立刻被那条旧值冲掉：
+        # 实测日志里出现连续两次 _set_status，第二次把第一次覆盖了。
+        # status_seq 由 play.py 的 _status() 和 control.mark_finished() 递增。
+        if status != self._last_status and (
+                self.control.status_seq != self._last_status_seq
+                or not self._started):
             self._last_status = status
+            self._last_status_seq = self.control.status_seq
             self._set_status(status)
             self.lbl_mini_status.config(text=status)
 

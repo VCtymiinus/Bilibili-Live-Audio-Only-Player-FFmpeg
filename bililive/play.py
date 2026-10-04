@@ -137,8 +137,11 @@ def _run_inner(room: int, volume: int, verbose: bool,
     con.info(f"bililive v{__version__}  —— 只听哔哩哔哩直播的声音")
 
     # 把状态同步给悬浮窗。on_status 可能为 None（纯命令行），所以统一走包装。
+    # status_seq 每次 +1：界面靠它判断「循环是否真的写过新状态」，
+    # 从而区分新状态和上一轮残留的旧文本（见 ui.py 的 _refresh）。
     def _status(text: str) -> None:
         control.status_text = text
+        control.status_seq += 1
         if on_status is not None:
             try:
                 on_status(text)

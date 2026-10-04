@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -206,6 +208,7 @@ class Overlay:
         # （见 _to_compact），那种小窗不挡视线是优点，主窗口不是。
 
         self._setup_style()
+        self._set_window_icon()
         # *** 建界面期间不要触发音量回调 ***
         # 回调里要更新「主窗口滑块」和「迷你悬浮窗滑块」两个控件，
         # 而它们是分别构造的 —— 先建哪个，另一个都还不存在。
@@ -232,6 +235,49 @@ class Overlay:
             self._room_var.set(str(room))
 
     # ------------------------------------------------------------ 样式
+
+    def _set_window_icon(self) -> None:
+        """给窗口和任务栏设图标。
+
+        为什么要单独做这件事：exe 的图标（PyInstaller --icon）只决定
+        **资源管理器里** exe 文件长什么样，以及部分场景下的任务栏；
+        而 Tkinter 窗口的标题栏和任务栏按钮是**运行时**取的，
+        不设的话就是一个空的默认图标（不是 exe 的图标）。
+        两者都设上，图标才在哪儿都一致。
+
+        两种形态用的是同一个 Tk 根窗口，所以设一次就够。
+        """
+        for path in self._icon_candidates():
+            try:
+                if os.path.isfile(path):
+                    # *** 不能写 iconbitmap(default=path) ***
+                    # 带 default= 时，Tk 设的是「**今后新建**的顶层窗口的默认
+                    # 图标」，**不包括当前这个窗口** —— 实测设完之后
+                    # win.iconbitmap() 返回空串、窗口类里的 HICON 也是 None，
+                    # 也就是完全没生效。
+                    # 直接传路径才是设当前窗口。
+                    self.win.iconbitmap(path)
+                    return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _icon_candidates():
+        """图标可能的落点，按优先级排。
+
+        打包后（onedir）图标和 exe 并排；源码运行时在源码目录里。
+        和 ffplay.py 的 app_dir() 是同一个思路：不依赖绝对路径。
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        cands = [
+            os.path.join(here, "bililive.ico"),          # 源码目录
+            os.path.join(here, "_iconout", "bililive.ico"),
+        ]
+        if getattr(sys, "frozen", False):
+            # 打包后：exe 所在目录
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            cands.insert(0, os.path.join(exe_dir, "bililive.ico"))
+        return cands
 
     def _setup_style(self) -> None:
         st = ttk.Style(self.win)

@@ -268,39 +268,6 @@ http://nonexistent-host-xyz.invalid/a.flv -> exit_code=0  "I/O error"
 
 ---
 
-## 打包
-
-```
-python probe/build_portable.py
-```
-
-产物 `bililive-portable-v1.0/`，约 102 MB：
-
-```
-start.bat            双击启动（纯 ASCII，自动找 Python）
-ffplay.exe           播放器（静态自包含）
-bililive_main.py     入口
-bililive/            程序包（只含 6 个在用模块）
-README.txt           使用说明
-没声音看这里.txt      排查清单
-```
-
-构建脚本会自动校验：启动器纯 ASCII、无开发机绝对路径、
-弃用模块未混入、版本号一致。
-
-### 关于 exe
-
-尝试过用 PyInstaller 打包，**放弃**，原因：
-
-1. PyPI 在当前网络下连不上（SSL 被中断），装不上 PyInstaller；
-2. 更根本的是**收益很小** —— ffplay 有 102 MB，塞进单文件 exe 会让它涨到
-   110 MB+，运行时还要解压到临时目录；而目标机器**仍然需要装 Python**。
-   exe 只省掉「装 Python」这一件事，却省不掉。
-
-绿色文件夹反而更简单、启动更快、更容易排错。
-
----
-
 ## 代码结构
 
 ```

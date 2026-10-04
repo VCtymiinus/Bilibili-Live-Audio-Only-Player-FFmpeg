@@ -33,7 +33,7 @@ python probe/extract_ffplay.py    # 从包里解出 ffplay.exe
 
 **免安装版**：`bililive-portable/` 目录自带 `ffplay.exe`，双击 `start.bat` 按提示输入房间号。目标机器仍需装 Python（3.8+），但不需要单独准备 ffmpeg。
 
-**桌面版**；`bililive-portable-win64` 是一个有前端的版本,可以直接填入房间号使用，并且随意调整声音。同时这个版本不需要Python，它已经被打包进程序了。
+## **桌面版**；`bililive-portable-win64` 是一个有前端的版本,可以直接填入房间号使用，并且随意调整声音。同时这个版本不需要Python，它已经被打包进程序了。
 
 ## 使用
 

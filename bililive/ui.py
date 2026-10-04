@@ -598,9 +598,40 @@ class Overlay:
             "<Configure>",
             lambda e: self._bm_canvas.itemconfigure(self._bm_win,
                                                     width=e.width))
-        # 滚轮。绑在 canvas 和卡片容器上，鼠标移到列表上就能滚。
-        for w in (self._bm_canvas, self._bm_inner):
-            w.bind("<MouseWheel>", self._bm_wheel)
+
+        # *** 滚轮：鼠标一进面板就全局接管 ***
+        # 原来只把 <MouseWheel> 绑在 canvas 和 _bm_inner 上，但 _bm_inner
+        # **被卡片完全盖住** —— 鼠标停在任意一张卡片上，事件落在卡片的 Label
+        # 上，根本传不到 canvas，于是滚轮完全没反应（用户反馈就是这个）。
+        # 给每张卡片逐个再绑一遍也能work，但卡片是每次重建新建的、还带着
+        # 一堆子 Label，很容易漏绑某几个。
+        # 更可靠的做法：鼠标进入面板时用 bind_all 接管滚轮，离开时解除。
+        # 这样面板里任何一个控件（含以后新加的）都能滚，不用逐个维护。
+        self._bm_scroll_on = False
+
+        def _enter(_e=None):
+            if self._bm_scroll_on:
+                return
+            self._bm_scroll_on = True
+            self.win.bind_all("<MouseWheel>", self._bm_wheel)
+
+        def _leave(_e=None):
+            if not self._bm_scroll_on:
+                return
+            self._bm_scroll_on = False
+            try:
+                self.win.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+
+        self._bm_scroll_enter = _enter
+        self._bm_scroll_leave = _leave
+        for w in (wrap, self._bm_canvas, self._bm_inner, parent):
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+        # 面板里的子控件（卡片、Label）不逐个绑，靠 Tk 的 bindtags 机制：
+        # 事件先跑控件自己的绑定，再跑 "all" 标签上的绑定。子控件没有自己的
+        # 滚轮绑定时，bind_all 注册的这个就会被执行 —— 这正是我们要的。
 
         # 空列表时的提示。**不要在这里建好留引用**：
         # 每次重建都会 destroy 掉 _bm_inner 的所有子控件，留着的引用就指向

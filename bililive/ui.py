@@ -225,6 +225,8 @@ class Overlay:
         self._img_pending: set = set()
         # 后台线程下载+解码好的图，等主线程来取（Image 对象，还没变成 PhotoImage）
         self._img_decoded: dict = {}
+        # 下载/解码失败的 key，用来把对应回调丢掉，避免无限堆积
+        self._img_failed: set = set()
         # 等图用的回调队列 [(key, cb)]，主线程轮询时兑现
         self._img_wait: list = []
         # 后台刷新开播状态的交接变量（主线程轮询取，见 _poll_bookmark_done）
@@ -656,6 +658,43 @@ class Overlay:
             scrollregion=self._bm_canvas.bbox("all"))
 
     @staticmethod
+    def _cover_placeholder(canvas, size: int, name: str = ""):
+        """封面缺失时的占位。
+
+        *** 为什么不用一个灰方块 ***
+        实测有些房间（比如房间 3）getRoomBaseInfo 返回的 cover 就是空串，
+        keyframe / user_cover 也是空，getInfoByRoom 又是 -352 —— 什么图都拿不到。
+        只画一个灰方块看起来像「界面坏了」。
+        首次收藏时也会走到这里：那时还没刷新过，cover 字段还是空的。
+
+        所以画**主播名的首字**：一个明确的圆形头像记号。
+        它传达了「这里有一个主播，只是没有封面图」，比灰块或音符清楚得多，
+        而且和整个列表的视觉语言一致。
+        """
+        try:
+            canvas.delete("all")
+            canvas.create_rectangle(0, 0, size, size, fill=_CARD_HI, outline="")
+            ch = ""
+            if name:
+                s = "".join(str(name).split())
+                if s:
+                    ch = s[0]
+            if ch:
+                r = size * 0.34
+                cx = cy = size / 2.0
+                canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                   fill=_CARD, outline=_LINE)
+                canvas.create_text(cx, cy, text=ch, fill=_FG_DIM,
+                                   font=(_UI_FONT, max(9, int(size * 0.34)),
+                                         "bold"))
+            else:
+                canvas.create_text(size / 2, size / 2, text="?",
+                                   fill=_FG_FAINT,
+                                   font=(_UI_FONT, max(9, int(size * 0.3))))
+        except Exception:
+            pass
+
+    @staticmethod
     def _live_of(item) -> int:
         """取 live_status：1 开播 / 0 未开播 / -1 未知。
 
@@ -688,16 +727,24 @@ class Overlay:
         cv = tk.Canvas(top, width=sz, height=sz, bg=_CARD_HI,
                        highlightthickness=0, bd=0)
         cv.pack(side="left")
-        # 开播状态点也画在封面上（左上角），比单独一行标签省地方
+        uname_raw = (item.get("uname") or "").strip()
+        # 先放占位，图下好了再覆盖（见 _set_card_cover）。
+        # 这样「没有封面」和「封面还在下载」都有像样的显示，而不是一块灰。
+        self._cover_placeholder(cv, sz, uname_raw)
+        # 一圈细边框，让占位和封面两种情况都有明确的边界
+        cv.create_rectangle(0, 0, sz, sz, outline=_LINE, width=1)
+        # 开播状态点画在**最上层**：占位图里也有内容，不放在最后会被盖住
         dot = _ACCENT if live == 1 else (_LINE if live == 0 else _FG_FAINT)
-        cv.create_oval(3, 3, 11, 11, fill=dot, outline=_CARD, width=1)
+        cv.create_oval(3, 3, 11, 11, fill=dot, outline=_CARD, width=1,
+                       tags="dot")
+        cv.tag_raise("dot")
 
         txt = tk.Frame(top, bg=_CARD)
         txt.pack(side="left", fill="both", expand=True, padx=(8, 0))
         # 房间号单独一行、用次要色：它是精确标识，用户要拿去核对
         tk.Label(txt, text=str(rid), bg=_CARD, fg=_ACCENT,
                  font=(_UI_FONT, 8, "bold"), anchor="w").pack(anchor="w")
-        uname = (item.get("uname") or "").strip() or "（未知主播）"
+        uname = uname_raw or "（未知主播）"
         lb_u = tk.Label(txt, text=self._clip(uname, 9), bg=_CARD, fg=_FG,
                         font=(_UI_FONT, 9), anchor="w")
         lb_u.pack(anchor="w")
@@ -834,6 +881,13 @@ class Overlay:
                 # 需要主线程做的只有「创建 PhotoImage」这一步。
                 with self._img_lock:
                     self._img_decoded[key] = img
+            else:
+                # *** 下载/解码失败也要留个记录 ***
+                # 不留的话 _img_wait 里的回调永远不会被兑现，也不会被清掉 ——
+                # 每次重建收藏卡片都往里塞一批，几次之后就无限堆积了。
+                # 用一个哨兵值表示「这张图拿不到」，_poll_covers 见到就丢弃回调。
+                with self._img_lock:
+                    self._img_failed.add(key)
 
         threading.Thread(target=worker, name="cover", daemon=True).start()
 
@@ -858,16 +912,21 @@ class Overlay:
                     self._img_cache[key] = ImageTk.PhotoImage(im)
             except Exception:
                 pass
-        # 2/3. 能兑现的回调就执行，其余留到下一轮
+        # 2/3. 能兑现的回调就执行，失败的丢弃，其余留到下一轮
         still, fire = [], []
         with self._img_lock:
             for key, cb in waits:
+                if key in self._img_failed:
+                    continue            # 拿不到，直接丢弃，别无限堆积
                 ph = self._img_cache.get(key)
                 if ph is not None:
                     fire.append((cb, ph))
                 else:
                     still.append((key, cb))
             self._img_wait = still
+            # 失败记录只在还有等待者时需要保留
+            if not self._img_wait:
+                self._img_failed.clear()
         for cb, ph in fire:
             try:
                 cb(ph)
@@ -1698,12 +1757,10 @@ class Overlay:
         try:
             self.cv_cover.delete("all")
             if img is None:
-                # 占位：一个居中的音符符号，明确表示「这里本该有封面」
-                self.cv_cover.create_rectangle(0, 0, cv, cv, fill=_CARD,
-                                               outline="")
-                self.cv_cover.create_text(cv / 2, cv / 2, text="♪",
-                                          fill=_FG_FAINT,
-                                          font=(_UI_FONT, 20))
+                # 占位和收藏卡片用同一套（主播名首字的圆形记号），
+                # 而不是一个音符 —— 没见过这个房间的人也能认出「这是谁」。
+                self._cover_placeholder(self.cv_cover, cv,
+                                        self.control.anchor or "")
             else:
                 self.cv_cover.create_image(0, 0, anchor="nw", image=img)
                 # *** 必须留引用 ***

@@ -2,16 +2,6 @@
 
 一个只在后台播放 B 站直播**声音**的本地小工具。不开浏览器、不解码视频、常驻挂机。
 
-```
-python -m bililive 26774400                 # 播放
-python -m bililive 26774400 --volume 60     # 指定音量
-python -m bililive --version                # 查看版本
-```
-
-发行包在 `bililive-portable-v1.0/`（见文末「打包」）。
-
----
-
 ## 它是怎么做到的
 
 核心结论：**B 站能直接给出纯音频流。**
@@ -77,7 +67,7 @@ tag 统计     : audio=685  video=0
 **直播间没开播** —— 不报错退出，而是等你：
 
 ```
-[02:24:25] 房间 1 -> room_id=5440
+[02:24:25] 房间 1 -> room_id=
 [02:24:30] 该直播间当前没有开播（live_status=2）。
 [02:24:30] 工具会每 30 秒自动检查一次，一开播就会开始播放。
 ```
@@ -97,7 +87,7 @@ tag 统计     : audio=685  video=0
 ## 音量怎么调
 
 ```
-python -m bililive 26774400 --volume 60
+python -m bililive 房间号 --volume 60
 ```
 
 `--volume` 取 **0 到 100**：`0` 静音，`100` 最大（默认）。
@@ -142,22 +132,7 @@ python probe/extract_ffplay.py     # 从已下载的包里解出 ffplay.exe
 | 便携性 | 复制到临时目录、从完全不同路径启动成功 |
 | 故障路径 | `test_failure_paths.py` 全部通过（离线故障注入） |
 
-### 一键复现
-
-```
-python probe/test_adts.py              # ADTS/解复用，不联网
-python probe/test_waveout.py           # waveOut 记账，不联网、不出声
-python probe/test_failure_paths.py     # 故障注入，不联网、不出声
-python probe/measure_traffic.py 26774400 10   # 流量对比，联网
-```
-
-### 仍需你确认的
-
-**实际听感**。开发环境无法回听 ffplay 的音频输出，音质、延迟是否合适只能由你判断。
-
----
-
-## 踩过的坑（都修了，记录备查）
+## 俩ai互相自查
 
 ### 1. `hdr.dwFlags = 0` 抹掉 `WHDR_PREPARED`
 `waveOutWrite` 必返 `34 = MMSYSERR_INVALPARAM`。实测：保留 flags 或显式写回

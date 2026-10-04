@@ -107,17 +107,34 @@ class Console:
 
 def run(room: int, volume: int, verbose: bool,
         control: PlayerControl | None = None, on_status=None) -> int:
-    from . import __version__
+    """播放一轮。
 
-    con = Console(verbose)
-    con.info(f"bililive v{__version__}  —— 只听哔哩哔哩直播的声音")
+    *** 这层壳的唯一职责：无论怎么退出，都要通知界面 ***
+    真正的逻辑在 _run_inner 里。用包装而不是在原函数里加 try/finally，
+    是因为原函数有 470 多行、四个 return 出口，为了包一层而整体缩进
+    会让 diff 变成一坨、也更容易改错。
 
-    # control 由 main() 传进来（悬浮窗共享同一个对象）。直接调用 run() 时
-    # 自己造一个，这样命令行用法完全不受影响。
+    为什么必须通知：播放循环退出后如果没人告诉界面，界面会一直停在
+    「正在连接 ...」而且按钮是**禁用**的 —— 用户看到的就是「卡死」。
+    实测：输入不存在的房间号时线程早已干净退出，按钮却永远不动。
+    """
     if control is None:
         control = PlayerControl(volume=volume)
     else:
         control.set_volume(volume)
+    try:
+        return _run_inner(room, volume, verbose, control, on_status)
+    finally:
+        # 恢复「开始收听」按钮、清掉「连接中」状态
+        control.mark_finished()
+
+
+def _run_inner(room: int, volume: int, verbose: bool,
+               control: PlayerControl, on_status=None) -> int:
+    from . import __version__
+
+    con = Console(verbose)
+    con.info(f"bililive v{__version__}  —— 只听哔哩哔哩直播的声音")
 
     # 把状态同步给悬浮窗。on_status 可能为 None（纯命令行），所以统一走包装。
     def _status(text: str) -> None:
@@ -243,10 +260,20 @@ def run(room: int, volume: int, verbose: bool,
                     # 区分「房间号本身有问题」和「接口临时抽风」。
                     # 前者重试一万次也不会好，直接告诉用户并退出，
                     # 否则打错一个数字就会看到无限重试的日志。
+                    #
+                    # *** 必须同时上报给界面 ***
+                    # 上面两行 con.info 只会打到控制台，而 windowed 打包版
+                    # **没有控制台** —— 用户什么都看不到，只看到按钮卡在
+                    # 「正在连接 ...」不动。实测反馈就是「输入不存在的房间号
+                    # 会卡死」。所以这里 report_error + mark_finished，
+                    # 让界面弹悬浮提示并把按钮复位。
                     con.info(f"房间号有问题: {e}")
                     con.info("请确认房间号是否正确，然后重新运行。")
+                    control.report_error(f"房间号不存在：{room}\n请检查后重新输入")
                     player.stop()
+                    job.terminate_all()
                     job.close()
+                    # 这里不用手动 mark_finished —— 外层 finally 会统一处理
                     return 3
                 con.info(f"解析房间失败: {type(e).__name__}: {e}")
                 stop.wait(backoff)
@@ -273,10 +300,22 @@ def run(room: int, volume: int, verbose: bool,
                 continue
 
         if live_status != 1:
-            # 0/2 都表示当前没有直播内容
+            # 0/2 都表示当前没有直播内容。
+            #
+            # *** 这和「房间不存在」必须分开提示 ***
+            # 房间号是对的，只是主播没开播 —— 用户该做的是「换一个正在播的
+            # 房间」或者「就在这儿等着」，而不是去改房间号。
+            # 合成一种提示会让人误以为号码打错了，然后改掉一个正确的号。
             con.info(f"该直播间当前没有开播（live_status={live_status}）。")
             con.info("工具会每 30 秒自动检查一次，一开播就会开始播放。")
             con.info("现在可以直接关掉窗口，或按 Ctrl+C 退出。")
+            _status("未开播，等待中 ...")
+            # 上报给界面弹提示。每轮都报一次，这样用户随时输入新号码
+            # 都能看到当前这个房间的真实状态。
+            control.report_offline(
+                "这个直播间现在没有开播\n"
+                "房间号是对的，工具会每 30 秒查一次；"
+                "也可以换一个正在播的房间号")
             waited = 0.0
             while waited < 30.0 and not stop.is_set():
                 stop.wait(1.0)

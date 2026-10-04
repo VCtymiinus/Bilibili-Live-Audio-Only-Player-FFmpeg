@@ -49,7 +49,8 @@ _FG_DIM = "#a49daa"      # 次要文字
 _FG_FAINT = "#736d7a"    # 提示文字
 _ACCENT = "#fb7299"      # B 站粉（品牌主色）
 _ACCENT_HI = "#ff8fb0"   # 悬停/按下时更亮一档
-_DANGER = "#ff6b6b"
+_DANGER = "#ff6b6b"      # 错误（红）
+_WARN = "#f0b34a"        # 提示/未开播（琥珀）—— 和错误区分开调性
 
 _UI_FONT = "Microsoft YaHei UI"
 
@@ -191,6 +192,13 @@ class Overlay:
         self._started = False
         # 当前正在听的房间号（用来判断用户是不是换了房间）
         self._room_now = None
+        # 悬浮提示的状态
+        self._last_error_seq = 0
+        self._last_offline_seq = 0
+        self._toast_job = None
+        # 是否正在「主动换房间」——用来区分「循环退出」是换台还是真结束，
+        # 免得换台过程中误报「已停止」
+        self._switch_in_progress = False
 
         self.win = tk.Tk()
         self.win.title("bililive")
@@ -218,6 +226,7 @@ class Overlay:
         self._ready = False
         self._build_compact()
         self._build_full()
+        self._build_toast()
         self.scale.set(self.control.volume)
         self.scale_mini.set(self.control.volume)
         self.lbl_vol.config(text=f"{self.control.volume}%")
@@ -613,11 +622,18 @@ class Overlay:
             self._set_status(f"正在切到房间 {room} ...")
         else:
             self._set_status(f"正在重新连接房间 {room} ...")
-        self.control.request_stop()
-        # 等旧线程真的结束，避免新旧两个循环同时操作同一个 ffplay
-        self._join_play_threads(timeout=8.0)
-        self.control.reset_stop()
-        self.control.reset_timer()
+        # 标记「这是主动换台」：旧循环退出后会 mark_finished()，
+        # 界面要能分辨「换台导致的退出」和「真的结束了」，
+        # 否则换台过程中会闪一下「已停止」（实测过的观感问题）。
+        self._switch_in_progress = True
+        try:
+            self.control.request_stop()
+            # 等旧线程真的结束，避免新旧两个循环同时操作同一个 ffplay
+            self._join_play_threads(timeout=8.0)
+            self.control.reset_stop()
+            self.control.reset_timer()
+        finally:
+            self._switch_in_progress = False
         self._start(room)
 
     def _join_play_threads(self, timeout: float = 8.0) -> None:
@@ -645,6 +661,9 @@ class Overlay:
         if self.control.paused:
             self.control.resume()
         self._started = True
+        # 清掉上一轮的「已结束」标记，新的一轮从头开始。
+        # 不清的话，_refresh 会在下一轮立刻把它当成「循环已退出」而复位按钮。
+        self.control.finished = False
         self._last_anchor = None
         self._last_title = None
         # 按钮文字/可用性统一交给 _refresh 里的状态机决定，
@@ -716,9 +735,22 @@ class Overlay:
           2. 状态文字变化时又去调一次 _update_buttons，两处各自为政，
              出现过「状态写正在继续、按钮却是可点的开始收听」这种自相矛盾。
         现在改成：**每次刷新都无条件按当前状态重算一遍按钮**。
-        反正只是给几个控件设文字/可用性，开销可以忽略，
-        换来的是永远不可能出现自相矛盾的状态。
         """
+        # ---- 播放循环退出了：必须把界面复位 ----
+        # 这是「输入不存在的房间号会卡死」那个 bug 的根因：
+        # 循环早就干净退出了，却没人通知界面，于是按钮永远停在
+        # 「正在连接 ...」且是禁用的，用户只能关掉程序。
+        if self.control.finished:
+            self.control.finished = False
+            if self._started:
+                self._started = False
+                self.control.playing = False
+                self._last_status = None
+                # 按钮文字由下面的状态机统一重算，这里不自己设
+                if not self._switch_in_progress:
+                    # 不是「换房间」主动停的，说明这轮真的结束了
+                    self._set_status("已停止。可以输入房间号重新开始。")
+
         paused = self.control.paused
         playing = self.control.playing
         self._last_playing = playing
@@ -738,6 +770,7 @@ class Overlay:
             self.lbl_mini_status.config(text=status)
 
         self._refresh_meta()
+        self._poll_error()
 
     def _update_buttons(self, playing: bool, paused: bool) -> None:
         """按当前状态更新按钮。
@@ -773,9 +806,19 @@ class Overlay:
 
         if self._started:
             resuming = "继续" in (self.control.status_text or "")
-            self.btn_main.config(state="disabled",
-                                 text="正在继续 ..." if resuming
-                                 else "正在连接 ...")
+            if resuming:
+                self.btn_main.config(state="disabled", text="正在继续 ...")
+            else:
+                # 「没开播」时循环还在跑（每 30 秒重查一次），但用户最想做的
+                # 往往是「换一个正在播的房间」。所以按钮保持**可点**：
+                # 点了就换到输入框里那个号。文字也据实说明。
+                offline = "未开播" in (self.control.status_text or "")
+                if entered is not None and entered != self._room_now:
+                    self.btn_main.config(state="normal", text="换到该房间")
+                elif offline:
+                    self.btn_main.config(state="normal", text="重新连接")
+                else:
+                    self.btn_main.config(state="disabled", text="正在连接 ...")
             self.btn_pause.config(state="disabled")
             return
 
@@ -792,6 +835,93 @@ class Overlay:
             return _parse_room(self._room_var.get())
         except Exception:
             return None
+
+    # ------------------------------------------------------------ 悬浮提示
+
+    def _poll_error(self) -> None:
+        """检查播放循环上报的状态，该提示就提示。
+
+        两种**必须区分**的情况：
+            error_seq   房间不存在  -> 房间号打错了，换一个（红色，错误调性）
+            offline_seq 没开播      -> 房间号是对的，等着或换一个正在播的
+                                        （琥珀色，提示调性，不是"出错"）
+        合成一种提示会让用户以为房间号打错了，然后去改一个本来正确的号。
+        """
+        if self.control.error_seq != self._last_error_seq:
+            self._last_error_seq = self.control.error_seq
+            self.toast(self.control.error_text or "出错了", kind="error")
+        elif self.control.offline_seq != self._last_offline_seq:
+            self._last_offline_seq = self.control.offline_seq
+            # 未开播是周期性重复的，给更长的展示时间（8 秒），
+            # 免得用户一转头就错过了
+            self.toast(self.control.offline_text or "未开播",
+                       kind="offline", ms=8000)
+
+    def toast(self, text: str, ms: int = 4200, kind: str = "error") -> None:
+        """在窗口上方浮出一张提示卡片，几秒后自动消失。
+
+        为什么不用 messagebox：模态对话框会阻塞，而且用户必须点一下才能
+        继续 —— 对一个「输入错了重输就行」的场景太重了。
+        为什么不用 lbl_status 显示：那行字很小、位置在底部，容易被忽略；
+        而这两种情况都是必须被看到的信息。
+
+        kind 决定配色：
+            error   -> 红色竖条（"出问题了，你得做点什么"）
+            offline -> 琥珀色竖条（"没问题，只是现在没有"）
+        用颜色区分调性，比在文案里解释更直接。
+        """
+        try:
+            self._toast_card.pack_forget()
+        except Exception:
+            pass
+        color = _WARN if kind == "offline" else _DANGER
+        try:
+            self._toast_bar.config(bg=color)
+        except Exception:
+            pass
+        self.lbl_toast.config(text=text)
+        # 贴到 full 帧的**最上方**，这样不会挤进原有布局的中间
+        try:
+            first = self.full.winfo_children()[0]
+        except Exception:
+            first = None
+        if first is not None:
+            self._toast_card.pack(fill="x", padx=18, pady=(10, 0),
+                                  side="top", before=first)
+        else:
+            self._toast_card.pack(fill="x", padx=18, pady=(10, 0), side="top")
+        self._toast_card.lift()
+        # 卡片占了空间，窗口要长高一点，否则会挤掉底部按钮
+        self._center_full(reposition=False)
+        if self._toast_job is not None:
+            try:
+                self.win.after_cancel(self._toast_job)
+            except Exception:
+                pass
+        self._toast_job = self.win.after(ms, self._toast_hide)
+
+    def _toast_hide(self) -> None:
+        self._toast_job = None
+        try:
+            self._toast_card.pack_forget()
+        except Exception:
+            pass
+        # 收掉卡片后把窗口高度收回来
+        self._center_full(reposition=False)
+
+    def _build_toast(self) -> None:
+        """搭好提示卡片（先不显示，等 toast() 调用才 pack）。"""
+        card = tk.Frame(self.win, bg=_CARD)
+        # 左边一条强调色竖条。颜色由 kind 决定（错误红 / 未开播琥珀），
+        # 所以要把这条竖条存下来，toast() 里改它的底色。
+        self._toast_bar = tk.Frame(card, bg=_DANGER, width=4)
+        self._toast_bar.pack(side="left", fill="y")
+        self.lbl_toast = tk.Label(card, text="", bg=_CARD, fg=_FG,
+                                  font=(_UI_FONT, 9), justify="left",
+                                  anchor="w", wraplength=380)
+        self.lbl_toast.pack(side="left", fill="x", expand=True,
+                            padx=10, pady=9)
+        self._toast_card = card
 
     def _refresh_meta(self) -> None:
         anchor = (self.control.anchor or "").strip()

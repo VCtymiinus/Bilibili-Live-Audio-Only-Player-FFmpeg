@@ -70,6 +70,54 @@ class PlayerControl:
         self.anchor = ""
         self.title = ""
 
+        # ---- 给界面的错误提示通道 ----
+        # *** 为什么必须有这个 ***
+        # 播放循环遇到「房间号不存在」这类永久错误时会直接返回，但它原来
+        # 只是往控制台 print 一句 —— 而打包成 windowed 后**没有控制台**，
+        # 用户什么都看不到，只看到按钮卡在「正在连接 ...」不动，
+        # 反馈就是「输入不存在的房间号会卡死」。
+        # 现在把错误写进这个字段，界面轮询到就弹一个悬浮提示。
+        # 用递增的 seq 而不是判断字符串变化：同一个错误提示两次也要能弹。
+        self.error_text = ""
+        self.error_seq = 0
+
+        # ---- 未开播通道（与上面分开，提示文案和调性都不同）----
+        self.offline_text = ""
+        self.offline_seq = 0
+
+        # 播放循环是否已经退出。界面靠它复位按钮 ——
+        # 否则循环退了、按钮还停在「正在连接 ...」且是禁用的（实测的 bug）。
+        self.finished = False
+
+    # ------------------------------------------------------------ 界面通知
+
+    def report_error(self, text: str) -> None:
+        """上报一个要展示给用户的错误。界面轮询到就弹提示。"""
+        self.error_text = str(text)
+        self.error_seq += 1
+
+    def report_offline(self, text: str) -> None:
+        """上报「房间存在但没开播」。
+
+        *** 为什么和 report_error 分开 ***
+        这两种情况必须给用户**不同的**提示，因为该做的事完全不同：
+            report_error   「房间不存在」-> 房间号打错了，**换一个**
+            report_offline 「没开播」    -> 房间号是对的，**换一个正在播的，
+                                            或者就在这儿等着**
+        如果合成一种提示，用户会以为房间号打错了，然后去改一个本来正确的号。
+
+        实现上单独用一个 seq：没开播是**周期性**的（每 30 秒一轮），
+        要能反复提示；而且它不应该像错误那样把界面弄成"出错"的调性。
+        """
+        self.offline_text = str(text)
+        self.offline_seq += 1
+
+    def mark_finished(self) -> None:
+        """标记本轮播放循环已退出。界面据此把按钮复位成可用状态。"""
+        self.finished = True
+        # 退出时不该再显示「播放中」
+        self.playing = False
+
     # ------------------------------------------------------------ 计时
 
     def start_timer(self) -> None:

@@ -444,6 +444,9 @@ class Overlay:
         else:
             x, y = self.win.winfo_x(), self.win.winfo_y()
         self.win.geometry(f"{w}x{h}+{x}+{y}")
+        if reposition:
+            # 窗口被程序自己挪过位置了，拖动基准点作废（否则下次拖动会弹跳）
+            self._reset_drag()
 
     # ------------------------------------------------------------ 迷你悬浮窗
 
@@ -497,15 +500,44 @@ class Overlay:
         self.btn_expand.pack(fill="x", padx=10, pady=(0, 10))
 
     def _to_compact(self) -> None:
-        """缩成右上角的迷你悬浮窗。"""
+        """缩成右上角的迷你悬浮窗。
+
+        *** 必须去掉系统标题栏 ***
+        悬浮窗自己画了 ❚❚ / ✕（迷你窗顶栏那几个），如果外面再套一层
+        Windows 标题栏，就会出现两套按钮，看起来也不像个悬浮窗 ——
+        用户截图反馈的就是这个。
+
+        之前这里是漏实现的：注释写着「迷你悬浮窗才去边框」，但代码里
+        从来没有调用过 overrideredirect，所以悬浮窗一直带着标题栏。
+
+        overrideredirect(True) 的连带效果正好都是悬浮窗想要的：
+          * 没有标题栏、没有系统按钮 —— 不再有两套按钮
+          * 不出现在任务栏和 Alt+Tab 里 —— 悬浮窗不该占这两个位置
+          * 系统不再给它画边框和阴影
+        代价是失去系统的移动/关闭，但这两件事界面里都自己做了
+        （顶栏可拖动、✕ 关程序）。
+        """
         self.full.pack_forget()
-        self.compact.pack(fill="both", expand=True)
+        # 先去掉边框，再摆位置：反过来的话窗口会先画一次带标题栏的样子
+        self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
+        self.compact.pack(fill="both", expand=True)
         self._set_alpha(0.94)          # 迷你窗保留半透明：小窗不挡视线是优点
         self._fit_compact()
 
     def _to_full(self) -> None:
         """从悬浮窗展开回完整窗口。"""
+        # *** 展开时必须把标题栏装回去 ***
+        # 主窗口没有系统标题栏时焦点行为很怪（实测：点击界面后按键会落进
+        # 房间号输入框，把房间号改掉）。所以主窗口一定要有标题栏。
+        self.win.overrideredirect(False)
+        # 从无边框切回普通窗口后，Windows 可能把窗口留在「不显示」状态，
+        # deiconify + lift 让它回来并拿到焦点
+        try:
+            self.win.deiconify()
+            self.win.lift()
+        except Exception:
+            pass
         self.compact.pack_forget()
         self.win.attributes("-topmost", False)
         self._set_alpha(1.0)           # 主窗口完全不透明，用户明确要求
@@ -562,6 +594,8 @@ class Overlay:
         self.win.update_idletasks()
         h = max(120, self.compact.winfo_reqheight())
         self.win.geometry(f"{w}x{h}+{sw - w - 12}+12")
+        # 窗口被自动挪到右上角了，拖动基准点作废
+        self._reset_drag()
 
     # ------------------------------------------------------------ 拖动
 
@@ -573,6 +607,16 @@ class Overlay:
         if self._drag:
             dx, dy = self._drag
             self.win.geometry(f"+{event.x_root - dx}+{event.y_root - dy}")
+
+    def _reset_drag(self) -> None:
+        """清掉拖动基准点。
+
+        *** 自动挪过窗口之后必须调用 ***
+        拖动时记的是「按下那一刻：鼠标 - 窗口位置」的差值。如果窗口在拖动
+        过程中被程序自己挪走了（换台、连上后长高、进出悬浮窗都会），这个
+        差值就过期了，下一次 <Motion> 会把窗口**猛地弹到鼠标位置**。
+        """
+        self._drag = None
 
     # ------------------------------------------------------------ 交互
 

@@ -347,12 +347,12 @@ class Overlay:
 
         打包后（onedir）图标和 exe 并排；源码运行时在源码目录里。
         和 ffplay.py 的 app_dir() 是同一个思路：不依赖绝对路径。
+
+        图标现在是外部提供的资源文件（bililive.ico，随源码和打包产物分发），
+        不再由脚本生成 —— 之前那个自绘生成器连同 _iconout/ 目录一起去掉了。
         """
         here = os.path.dirname(os.path.abspath(__file__))
-        cands = [
-            os.path.join(here, "bililive.ico"),          # 源码目录
-            os.path.join(here, "_iconout", "bililive.ico"),
-        ]
+        cands = [os.path.join(here, "bililive.ico")]     # 源码目录
         if getattr(sys, "frozen", False):
             # 打包后：exe 所在目录
             exe_dir = os.path.dirname(os.path.abspath(sys.executable))

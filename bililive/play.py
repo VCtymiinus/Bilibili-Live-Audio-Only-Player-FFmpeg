@@ -310,12 +310,15 @@ def _run_inner(room: int, volume: int, verbose: bool,
             con.info("工具会每 30 秒自动检查一次，一开播就会开始播放。")
             con.info("现在可以直接关掉窗口，或按 Ctrl+C 退出。")
             _status("未开播，等待中 ...")
-            # 上报给界面弹提示。每轮都报一次，这样用户随时输入新号码
-            # 都能看到当前这个房间的真实状态。
-            control.report_offline(
-                "这个直播间现在没有开播\n"
-                "房间号是对的，工具会每 30 秒查一次；"
-                "也可以换一个正在播的房间号")
+            # 只在**新出现**的未开播房间上报一次。
+            # 这个分支每 30 秒就会走一遍，如果每轮都报，提示会每 30 秒
+            # 重新弹一次；而倒计时已经由上面那行状态文字显示了。
+            if control.offline_room != room:
+                control.offline_room = room
+                control.report_offline(
+                    "这个直播间现在没有开播\n"
+                    "房间号是对的，工具会每 30 秒查一次；"
+                    "也可以换一个正在播的房间号")
             waited = 0.0
             while waited < 30.0 and not stop.is_set():
                 stop.wait(1.0)

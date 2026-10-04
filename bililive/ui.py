@@ -444,8 +444,24 @@ class Overlay:
         else:
             x, y = self.win.winfo_x(), self.win.winfo_y()
         self.win.geometry(f"{w}x{h}+{x}+{y}")
+
         if reposition:
-            # 窗口被程序自己挪过位置了，拖动基准点作废（否则下次拖动会弹跳）
+            # *** 必须再设一次，而且中间要 update() ***
+            # 这不是保险，是必需的。实测（逐行打印出来的）：
+            #     设完 geometry       geom='260x130+633+256'  位置已写入
+            #     update() 之后        pos=(1435,12) 440x367   位置被系统改回右上角
+            #     再设一次 + update    pos=(633,256) 440x367   这才生效
+            # 原因：切换 overrideredirect 时 Tk 会**销毁并重建包装窗口**，
+            # Windows 在重建时用默认位置覆盖刚设的坐标（尺寸保住了、位置被冲掉）。
+            # 所以要在窗口真正映射之后重新设一遍。
+            # 只调一次的话，从悬浮窗展开回主界面会停在右上角 —— 用户报的就是这个。
+            # update() 在窗口正在销毁时会抛 TclError，所以包一层；
+            # 真抛了也不该让整个切换流程断掉（窗口至少还有正确的尺寸）。
+            try:
+                self.win.update()
+                self.win.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                pass
             self._reset_drag()
 
     # ------------------------------------------------------------ 迷你悬浮窗
@@ -704,10 +720,16 @@ class Overlay:
         self.control.playing = False
         if self.control.paused:
             self.control.resume()
+        # *** 用户已经开始新一轮了，立刻收掉上一轮的提示 ***
+        # 否则「房间号不存在 / 没有开播」会挂到自己的计时器到点为止，
+        # 而那时新房间可能都已经出声了（用户报的正是这个）。
+        self.hide_toast()
         self._started = True
         # 清掉上一轮的「已结束」标记，新的一轮从头开始。
         # 不清的话，_refresh 会在下一轮立刻把它当成「循环已退出」而复位按钮。
         self.control.finished = False
+        # 换房间后重新允许弹「未开播」提示（见 play.py 里 offline_room 的用途）
+        self.control.offline_room = None
         self._last_anchor = None
         self._last_title = None
         # 按钮文字/可用性统一交给 _refresh 里的状态机决定，
@@ -952,6 +974,30 @@ class Overlay:
             pass
         # 收掉卡片后把窗口高度收回来
         self._center_full(reposition=False)
+
+    def hide_toast(self) -> None:
+        """立刻收掉提示卡片，并取消它自己的计时器。
+
+        *** 开始新一轮播放时必须调用 ***
+        提示卡片有独立的寿命计时（错误 4.2 秒、未开播 8 秒），不会因为
+        用户换了房间而消失。实测的现象就是：
+            输入新房间号 -> 点击开始 -> 已经出声了，
+            上一次的「房间号不存在 / 没有开播」还挂在窗口上，
+            要等原来的 4.2/8 秒计时到点才没 —— 用户报的「两三秒之后才会没」。
+        根因是计时器没人取消。所以一旦用户做出新动作，就立刻收掉旧提示。
+        """
+        if self._toast_job is not None:
+            try:
+                self.win.after_cancel(self._toast_job)
+            except Exception:
+                pass
+            self._toast_job = None
+        try:
+            if self._toast_card.winfo_ismapped():
+                self._toast_card.pack_forget()
+                self._center_full(reposition=False)
+        except Exception:
+            pass
 
     def _build_toast(self) -> None:
         """搭好提示卡片（先不显示，等 toast() 调用才 pack）。"""

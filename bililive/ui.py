@@ -1165,8 +1165,12 @@ class Overlay:
 
     # ------------------------------------------------------------ 开播状态
 
-    def refresh_bookmarks(self, auto: bool = False) -> None:
-        """查一遍所有收藏的开播状态。auto=True 表示是启动时自动查的。
+    def refresh_bookmarks(self, auto: bool = False, only: list | None = None,
+                          batch_seconds: float | None = None) -> None:
+        """查一遍收藏的开播状态。auto=True 表示是启动时自动查的。
+
+        only 给定时只查这些房间号（用于「上一轮没查完，接着查」）。
+        batch_seconds 可覆盖单批上限（默认 BATCH_SEC）。
 
         *** 线程规则：后台线程只查网络 + 写 store，绝不碰 Tk ***
         第一版在 check_live 的 on_one 回调里调了 self.win.after(0, ...) 想逐条
@@ -1184,33 +1188,36 @@ class Overlay:
             return
         self._bm_refreshing = True
         self.btn_refresh.config(text="刷新中…", fg=_FG_FAINT)
-        ids = [int(it["room_id"]) for it in self.store.all()]
+        if only:
+            ids = [int(x) for x in only]
+        else:
+            ids = [int(it["room_id"]) for it in self.store.all()]
 
         # 整体超时基准。定义在 worker 之前，避免读起来像「先用后定义」。
         t_start = time.time()
+        # 单批上限。一轮查不完就自动接着查下一批（见 _refreshing_done），
+        # 不再像以前那样静默放弃剩下的。
+        # 存到实例上是为了续批时沿用同一个上限（否则第二批会回落到默认值，
+        # 测试里就逼不出「多批续查」这个路径）。
+        if batch_seconds:
+            self._bm_batch_sec = float(batch_seconds)
+        BATCH_SECONDS = float(getattr(self, "_bm_batch_sec", 0) or 25.0)
 
         def _deadline_passed() -> bool:
-            return time.time() - t_start > 30.0
+            return time.time() - t_start > BATCH_SECONDS
+
+        pending = []
 
         def worker():
-            """后台：只做网络请求和写盘。
-
-            *** 绝不调用任何 Tk 方法，连 win.after() 也不调 ***
-            第一版在这里调 self.win.after(0, ...) 把结果送回主线程，结果
-            工作线程卡死在第一间房之后（实测：check_live 打了「开始」就再没
-            打「结束」，按钮永远停在「刷新中…」）。
-            Tk 不是线程安全的，从后台线程调 after 会出这种事 ——
-            我在测试脚本里犯同一个错时，脚本直接把整个进程挂死了。
-            现在的做法是「后台只写共享变量，主线程轮询取结果」，
-            也就是本项目 control 对象一直在用的模式。
-            """
+            """后台：只做网络请求和写盘。"""
             result = {}
             try:
                 from .bookmarks import check_live
-                # 单次请求 6 秒、整体 30 秒封顶。收藏多或网络差时宁可少查几个，
-                # 也不能让「刷新中」无限转下去。
+                # 单次请求 6 秒，整批 25 秒封顶；没轮到的房间号会进 pending，
+                # 由主线程接着发起下一批。
                 result = check_live(ids, timeout=6.0,
-                                    should_stop=_deadline_passed)
+                                    should_stop=_deadline_passed,
+                                    skipped=pending)
             except Exception:
                 result = {}
             for rid, info in result.items():
@@ -1225,6 +1232,7 @@ class Overlay:
             # 只写变量。主线程在 _poll_bookmark_done() 里取。
             self._bm_result = result
             self._bm_auto = auto
+            self._bm_pending = pending
             self._bm_done = True
 
         threading.Thread(target=worker, name="bm-live", daemon=True).start()
@@ -1235,12 +1243,14 @@ class Overlay:
             return
         self._bm_done = False
         result = self._bm_result or {}
+        pending = self._bm_pending or []
         self._bm_result = {}
+        self._bm_pending = []
         auto = self._bm_auto
         self._bm_auto = False
-        self._refreshing_done(result, auto)
+        self._refreshing_done(result, auto, pending)
 
-    def _refreshing_done(self, result: dict, auto: bool) -> None:
+    def _refreshing_done(self, result: dict, auto: bool, pending: list) -> None:
         """刷新收尾。只在主线程执行。"""
         self._bm_refreshing = False
         try:
@@ -1248,6 +1258,22 @@ class Overlay:
         except Exception:
             pass
         self._rebuild_bookmarks_ui()
+        # *** 还有没查完的，接着查下一批 ***
+        # 原来这里是静默放弃：超过 30 秒就不管了，那些房间会永远停在
+        # 「状态未知」直到用户手动点刷新 —— 收藏多、网络慢时看起来就是
+        # 「最后那些永远是未知」。现在自动续批，直到全部查完。
+        if pending:
+            # 续批次数上限，防止「一直查不完」时无限循环
+            self._bm_batches = getattr(self, "_bm_batches", 0) + 1
+            if self._bm_batches <= 20:
+                try:
+                    self.btn_refresh.config(text="刷新中…", fg=_FG_FAINT)
+                except Exception:
+                    pass
+                self.win.after(600, lambda: self.refresh_bookmarks(
+                    auto=False, only=pending))
+                return
+        self._bm_batches = 0
         if auto and result:
             live_n = sum(1 for it in self.store.all()
                          if self._live_of(it) == 1)

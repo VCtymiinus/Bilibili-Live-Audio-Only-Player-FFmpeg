@@ -204,7 +204,7 @@ class BookmarkStore:
 
 
 def check_live(room_ids: list[int], client=None, timeout: float = 8.0,
-               on_one=None, should_stop=None) -> dict:
+               on_one=None, should_stop=None, skipped: list | None = None) -> dict:
     """查询一批房间的开播状态。返回 {room_id: {live_status, uname, title, cover}}。
 
     只查得到结果的房间，查不到的**不出现在返回里** —— 调用方据此保留旧状态，
@@ -214,16 +214,27 @@ def check_live(room_ids: list[int], client=None, timeout: float = 8.0,
     on_one(room_id, info) 每查到一个就回调一次，让界面能逐个更新，
     不用等全部查完（收藏多的时候体感差别很大）。
     should_stop() 返回 True 时提前结束 —— 用户连点刷新或关窗口时用得上。
+
+    *** skipped ***
+
+    提前结束时，**没轮到的房间号会追加进这个列表**。
+    为什么要这个：原来提前结束就是静默放弃，那些房间会永远停在
+    「状态未知」，直到用户手动点刷新 —— 收藏多、网络慢的时候看起来就是
+    「最后那些永远是未知」。调用方拿到 skipped 之后可以接着查下一批，
+    而不是把它们丢掉。
     """
     from .biliapi import BiliLiveClient, BiliApiError
 
     if client is None:
         client = BiliLiveClient(timeout=timeout)
     out = {}
-    for rid in room_ids:
+    for pos, rid in enumerate(room_ids):
         if should_stop is not None:
             try:
                 if should_stop():
+                    # 本轮没轮到的全部交回调用方，别静默丢掉
+                    if skipped is not None:
+                        skipped.extend(int(x) for x in room_ids[pos:])
                     break
             except Exception:
                 pass

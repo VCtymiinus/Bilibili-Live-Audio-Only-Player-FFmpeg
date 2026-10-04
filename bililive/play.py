@@ -353,6 +353,10 @@ def _run_inner(room: int, volume: int, verbose: bool,
                     # 这两个字段是界面轮询读取的，所以在这里赋值就够了。
                     control.anchor = uname
                     control.title = title
+                    # 封面也要同步：主界面显示封面，收藏时把 URL 存进快照。
+                    # 注意放在 if/else **外面** —— 两种返回形状都要用到它，
+                    # 只写在其中一个分支里的话另一条路径就永远没有封面。
+                    control.cover = m.get("cover") or ""
                     if title or uname:
                         con.info(f"主播 {uname} | {title}")
                     else:

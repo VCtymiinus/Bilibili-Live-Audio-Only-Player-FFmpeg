@@ -29,12 +29,24 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 from tkinter import ttk
+
+# 封面图要用 Pillow。为什么不用 tk.PhotoImage：
+#   PhotoImage 只认 PNG/GIF，而实测 B 站的封面**两种格式都有** ——
+#   开播中的是 .png，未开播的是 .jpg（`.../new_room_cover/...jpg`）。
+#   用 PhotoImage 的话未开播的封面会整片加载失败。
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except Exception:          # 打包漏了 Pillow 时也不该整个程序起不来
+    _HAS_PIL = False
 
 # ---------------------------------------------------------------- 配色
 # 主题：B 站粉。官方品牌色是 #FB7299（B 站 Logo 和 App 主色）。
@@ -180,6 +192,16 @@ class _Slider(tk.Canvas):
 class Overlay:
     """主窗口 + 迷你悬浮窗,两副面孔同一个 Tk 根窗口。"""
 
+    # ---- 封面图相关常量 ----
+    COVER_MAIN = 96        # 主界面封面边长
+    COVER_CARD = 44        # 收藏卡片封面边长
+    # 收藏面板宽度。两列卡片：每张约 (380-20-8)/2 = 176px。
+    # 这个值要压住 —— 太宽会把主窗口撑到 900px 以上，看着很空。
+    _SIDE_W = 380
+    # 向 B 站图床要缩略图的后缀。原图 121 KB，加这个变成约 1.5 KB（82 倍）。
+    # 实测它返回 WEBP，Pillow 能读。
+    _THUMB = "@%dw_%dh_1c.webp"
+
     def __init__(self, control, room: int | None = None):
         self.control = control
         self.room = room
@@ -189,9 +211,34 @@ class Overlay:
         self._last_playing = None
         self._last_anchor = None
         self._last_title = None
+        self._last_cover = None
         self._started = False
         # 当前正在听的房间号（用来判断用户是不是换了房间）
         self._room_now = None
+        # ---- 收藏 / 封面 ----
+        # 已经下载并缩放好的封面图，key 是「URL + 尺寸」。
+        # *** 必须留住引用 ***：PhotoImage 被垃圾回收后，控件上就变成一片空白 ——
+        # 这是 Tkinter 里最经典的坑之一。
+        self._img_cache: dict = {}
+        self._img_lock = threading.Lock()
+        # 正在下载的 URL，避免同一张图被并发重复下载
+        self._img_pending: set = set()
+        # 后台线程下载+解码好的图，等主线程来取（Image 对象，还没变成 PhotoImage）
+        self._img_decoded: dict = {}
+        # 等图用的回调队列 [(key, cb)]，主线程轮询时兑现
+        self._img_wait: list = []
+        # 后台刷新开播状态的交接变量（主线程轮询取，见 _poll_bookmark_done）
+        self._bm_done = False
+        self._bm_result: dict = {}
+        self._bm_auto = False
+        # 收藏卡片的控件，更新开播状态时按房间号找回来
+        self._bm_cards: dict = {}
+        # 收藏面板当前是否只显示开播中的
+        self._bm_only_live = False
+        # 正在刷新开播状态（防重复点击）
+        self._bm_refreshing = False
+        # 主界面封面当前显示的是哪个 URL（避免重复重设）
+        self._cover_shown = None
         # 悬浮提示的状态
         self._last_error_seq = 0
         self._last_offline_seq = 0
@@ -225,6 +272,12 @@ class Overlay:
         # 自绘滑块的 set() 本身不回调，所以这里主要防的是别处意外触发；
         # 保留 _ready 是一个便宜且明确的保险。
         self._ready = False
+        # 收藏列表。读盘失败时 BookmarkStore 内部退回空列表，不会抛出来。
+        try:
+            from .bookmarks import BookmarkStore
+            self.store = BookmarkStore()
+        except Exception:
+            self.store = None
         self._build_compact()
         self._build_full()
         self._build_toast()
@@ -233,6 +286,8 @@ class Overlay:
         self.lbl_vol.config(text=f"{self.control.volume}%")
         self.lbl_mini_vol.config(text=f"{self.control.volume}%")
         self._ready = True
+        # 先把已有的收藏画出来（用盘里的快照，不发任何网络请求）
+        self.rebuild_bookmarks()
         # *** 构造完必须立刻刷一次界面 ***
         # 否则按钮停在 Tk 的默认状态上（实测：「暂停」一打开就是可点的，
         # 但那时根本没开始听，要等第一次 200ms 轮询才变灰）。
@@ -240,6 +295,9 @@ class Overlay:
         self._refresh(force=True)
         self._center_full()
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+        # *** 每次打开软件都触发一次「查看开播状态」***（用户明确要求）。
+        # 延后 400ms 是为了先让窗口出来，别把启动路径堵在网络上。
+        self.win.after(400, lambda: self.refresh_bookmarks(auto=True))
 
         if room is not None:
             self._room_var.set(str(room))
@@ -346,14 +404,34 @@ class Overlay:
                  font=(_UI_FONT, 9)).pack(side="left", padx=(8, 0), pady=(6, 0))
 
         tk.Frame(self.full, bg=_LINE, height=1).pack(fill="x", padx=22,
-                                                     pady=(12, 16))
+                                                     pady=(12, 14))
+
+        # ---- 主体：左（播放控制）+ 右（收藏列表）----
+        # 用两列而不是单列：收藏是「边看边点」的东西，放右侧不打断左侧操作。
+        # 左列要 fill/expand，右列固定宽（否则收藏卡片会被拉变形）。
+        body = tk.Frame(self.full, bg=_BG)
+        body.pack(fill="both", expand=True)
+        self._body = body
+
+        col = tk.Frame(body, bg=_BG)
+        col.pack(side="left", fill="both", expand=True)
+        self._main_col = col
+
+        tk.Frame(body, bg=_LINE, width=1).pack(side="left", fill="y",
+                                              padx=(6, 0))
+
+        side = tk.Frame(body, bg=_BG, width=self._SIDE_W)
+        side.pack(side="left", fill="y", padx=(0, 0))
+        side.pack_propagate(False)      # 保持固定宽度，不被内容撑开
+        self._side = side
+        self._build_bookmarks(side)
 
         # ---- 房间号 ----
-        tk.Label(self.full, text="直播间房间号", bg=_BG, fg=_FG_DIM,
-                 font=(_UI_FONT, 9)).pack(anchor="w", padx=24)
+        tk.Label(col, text="直播间房间号", bg=_BG, fg=_FG_DIM,
+                 font=(_UI_FONT, 9)).pack(anchor="w", padx=(24, 16))
         self._room_var = tk.StringVar(value="")
-        self.ent_room = self._mk_entry(self.full, self._room_var)
-        self.ent_room.pack(padx=24, pady=(6, 0), fill="x")
+        self.ent_room = self._mk_entry(col, self._room_var)
+        self.ent_room.pack(padx=(24, 16), pady=(6, 0), fill="x")
         # 回车即开始 —— 用户明确要「点回车就能用」
         self.ent_room.bind("<Return>", lambda e: self._on_start())
         self.ent_room.bind("<KP_Enter>", lambda e: self._on_start())
@@ -364,26 +442,49 @@ class Overlay:
         # 而且旧逻辑根本不看输入框，按钮永远显示「正在播放」。
         self._room_var.trace_add("write", lambda *a: self._refresh())
 
-        tk.Label(self.full, text="地址栏 live.bilibili.com/ 后面那串数字",
-                 bg=_BG, fg=_FG_FAINT, font=(_UI_FONT, 8)).pack(anchor="w",
-                                                                padx=24,
-                                                                pady=(5, 0))
+        tk.Label(col, text="地址栏 live.bilibili.com/ 后面那串数字",
+                 bg=_BG, fg=_FG_FAINT, font=(_UI_FONT, 8)).pack(
+                     anchor="w", padx=(24, 16), pady=(5, 0))
 
-        # ---- 主播 / 直播间名（连上之前不占地方，连上后才显示）----
+        # ---- 主播 / 封面 / 标题（连上之前不占地方，连上后才显示）----
         # 用 pack/pack_forget 动态出入，而不是留一片空白占位：
         # 没连上时界面保持紧凑，连上后信息才出现。
-        self.meta = tk.Frame(self.full, bg=_BG)
-        self.lbl_anchor = tk.Label(self.meta, text="", bg=_BG, fg=_FG,
+        self.meta = tk.Frame(col, bg=_BG)
+        # 封面在左，文字在右；收藏星标放在封面**上方**（用户要求
+        # 「封面上面有个收藏的黄星按钮」）。
+        self._cover_box = tk.Frame(self.meta, bg=_BG, width=self.COVER_MAIN,
+                                   height=self.COVER_MAIN)
+        self._cover_box.pack(side="left")
+        self._cover_box.pack_propagate(False)
+        cv = self.COVER_MAIN
+        self.cv_cover = tk.Canvas(self._cover_box, width=cv, height=cv,
+                                  bg=_CARD, highlightthickness=0, bd=0)
+        self.cv_cover.place(x=0, y=0)
+        # 星标压在封面右上角。用 Canvas 里画的星形而不是字符 ★：
+        # 字符在不同字体下大小/基线差别很大，画出来的才能精确控制位置和大小。
+        self.btn_star = tk.Canvas(self._cover_box, width=26, height=26,
+                                  bg=_BG, highlightthickness=0, bd=0,
+                                  cursor="hand2")
+        self.btn_star.place(x=cv - 26, y=0)
+        self._star_on = None            # 当前画的是「已收藏」还是「未收藏」
+        self.btn_star.bind("<Button-1>", lambda e: self._on_star())
+        self.btn_star.bind("<Enter>", lambda e: self._draw_star(hover=True))
+        self.btn_star.bind("<Leave>", lambda e: self._draw_star(hover=False))
+        self._draw_star()
+
+        info = tk.Frame(self.meta, bg=_BG)
+        info.pack(side="left", fill="both", expand=True, padx=(12, 16))
+        self.lbl_anchor = tk.Label(info, text="", bg=_BG, fg=_FG,
                                    font=(_UI_FONT, 10, "bold"), anchor="w")
         self.lbl_anchor.pack(anchor="w")
-        self.lbl_title = tk.Label(self.meta, text="", bg=_BG, fg=_FG_DIM,
+        self.lbl_title = tk.Label(info, text="", bg=_BG, fg=_FG_DIM,
                                   font=(_UI_FONT, 9), anchor="w",
                                   justify="left")
         self.lbl_title.pack(anchor="w", pady=(2, 0))
 
         # ---- 音量 ----
-        vrow = tk.Frame(self.full, bg=_BG)
-        vrow.pack(fill="x", padx=24, pady=(16, 0))
+        vrow = tk.Frame(col, bg=_BG)
+        vrow.pack(fill="x", padx=(24, 16), pady=(16, 0))
         # 保存下来：主播信息那块连上后要插到它前面（见 _refresh_meta）。
         # pack 的 before= 需要一个具体控件，靠遍历 winfo_children 找太脆。
         self._vrow = vrow
@@ -392,17 +493,17 @@ class Overlay:
         self.lbl_vol = tk.Label(vrow, text="100%", bg=_BG, fg=_FG,
                                 font=(_UI_FONT, 9, "bold"))
         self.lbl_vol.pack(side="right")
-        self.scale = _Slider(self.full, value=self.control.volume,
+        self.scale = _Slider(col, value=self.control.volume,
                              command=self._on_vol_move)
-        self.scale.pack(fill="x", padx=24, pady=(4, 0))
+        self.scale.pack(fill="x", padx=(24, 16), pady=(4, 0))
 
         # ---- 状态 ----
-        self.lbl_status = tk.Label(self.full, text="输入房间号后点「开始收听」，或直接按回车",
+        self.lbl_status = tk.Label(col, text="输入房间号后点「开始收听」，或直接按回车",
                                    bg=_BG, fg=_FG_FAINT, font=(_UI_FONT, 9),
                                    anchor="w", justify="left")
         # 换行宽度不写死，由 _apply_wraplengths() 按窗口实际宽度设置。
         # 写死 372 时窗口窄了文字会溢出被裁，而不是换行。
-        self.lbl_status.pack(fill="x", padx=24, pady=(16, 0))
+        self.lbl_status.pack(fill="x", padx=(24, 16), pady=(16, 0))
 
         # ---- 底部按钮 ----
         # 只保留两个：主按钮（开始/继续，同一个）+ 暂停。
@@ -412,8 +513,8 @@ class Overlay:
         #   暂停        -> 暂停按钮
         #   停止        -> 关窗口就行（Job Object 会连带杀掉 ffplay）
         #   缩成悬浮窗  -> 「缩成悬浮窗」也在这一行，它是形态切换不是播放控制
-        brow = tk.Frame(self.full, bg=_BG)
-        brow.pack(fill="x", padx=22, pady=(14, 18))
+        brow = tk.Frame(col, bg=_BG)
+        brow.pack(fill="x", padx=(22, 16), pady=(14, 18))
         self.btn_main = ttk.Button(brow, text="开始收听", style="big.TButton",
                                    command=self._on_main)
         self.btn_main.pack(side="left", fill="x", expand=True)
@@ -424,6 +525,506 @@ class Overlay:
                                    style="ghost.TButton",
                                    command=self._to_compact)
         self.btn_mini.pack(side="left", padx=(8, 0))
+
+    # ================================================== 收藏（书签）列表
+
+    def _build_bookmarks(self, parent) -> None:
+        """右侧收藏面板：标题栏 + 刷新按钮 + 可滚动的两列卡片。"""
+        # ---- 面板标题 ----
+        hd = tk.Frame(parent, bg=_BG)
+        hd.pack(fill="x", padx=(12, 12), pady=(0, 8))
+        tk.Label(hd, text="收藏", bg=_BG, fg=_FG,
+                 font=(_UI_FONT, 11, "bold")).pack(side="left")
+        self.lbl_bm_count = tk.Label(hd, text="", bg=_BG, fg=_FG_FAINT,
+                                     font=(_UI_FONT, 8))
+        self.lbl_bm_count.pack(side="left", padx=(6, 0), pady=(3, 0))
+        # 「只看开播」开关：收藏多了以后，用户最想做的是从正在播的里面挑一个
+        self.btn_bm_live = tk.Label(hd, text="只看开播", bg=_BG, fg=_FG_FAINT,
+                                    font=(_UI_FONT, 8), cursor="hand2",
+                                    padx=6, pady=2)
+        self.btn_bm_live.pack(side="right")
+        self.btn_bm_live.bind("<Button-1>", lambda e: self._toggle_only_live())
+        self.btn_refresh = tk.Label(hd, text="刷新状态", bg=_CARD, fg=_FG,
+                                    font=(_UI_FONT, 8), cursor="hand2",
+                                    padx=8, pady=3)
+        self.btn_refresh.pack(side="right", padx=(0, 8))
+        self.btn_refresh.bind("<Button-1>", lambda e: self.refresh_bookmarks())
+        self.btn_refresh.bind("<Enter>",
+                              lambda e: self.btn_refresh.config(bg=_CARD_HI))
+        self.btn_refresh.bind("<Leave>",
+                              lambda e: self.btn_refresh.config(bg=_CARD))
+
+        # ---- 可滚动区域 ----
+        # Tkinter 没有现成的滚动容器，标准做法就是 Canvas + 内嵌 Frame。
+        wrap = tk.Frame(parent, bg=_BG)
+        wrap.pack(fill="both", expand=True, padx=(12, 8), pady=(0, 12))
+        self._bm_canvas = tk.Canvas(wrap, bg=_BG, highlightthickness=0, bd=0)
+        self._bm_canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(wrap, orient="vertical",
+                           command=self._bm_canvas.yview)
+        sb.pack(side="right", fill="y")
+        self._bm_canvas.configure(yscrollcommand=sb.set)
+        # 卡片容器
+        self._bm_inner = tk.Frame(self._bm_canvas, bg=_BG)
+        self._bm_win = self._bm_canvas.create_window(
+            (0, 0), window=self._bm_inner, anchor="nw")
+        self._bm_inner.bind(
+            "<Configure>",
+            lambda e: self._bm_canvas.configure(
+                scrollregion=self._bm_canvas.bbox("all")))
+        self._bm_canvas.bind(
+            "<Configure>",
+            lambda e: self._bm_canvas.itemconfigure(self._bm_win,
+                                                    width=e.width))
+        # 滚轮。绑在 canvas 和卡片容器上，鼠标移到列表上就能滚。
+        for w in (self._bm_canvas, self._bm_inner):
+            w.bind("<MouseWheel>", self._bm_wheel)
+
+        # 空列表时的提示。**不要在这里建好留引用**：
+        # 每次重建都会 destroy 掉 _bm_inner 的所有子控件，留着的引用就指向
+        # 一个已销毁的控件，下次 config() 会抛
+        # "invalid command name ...!label"（实测踩到，异常还会刷在控制台）。
+        # 改成每次重建时按需新建，引用即时可用即时丢。
+
+    def _bm_wheel(self, event) -> None:
+        try:
+            self._bm_canvas.yview_scroll(int(-event.delta / 120), "units")
+        except Exception:
+            pass
+
+    def _toggle_only_live(self) -> None:
+        self._bm_only_live = not self._bm_only_live
+        self.btn_bm_live.config(
+            fg=_ACCENT if self._bm_only_live else _FG_FAINT,
+            text="只看开播" if not self._bm_only_live else "只看开播 ✓")
+        self.rebuild_bookmarks()
+
+    def rebuild_bookmarks(self) -> None:
+        """按当前 store 重建收藏卡片。
+
+        *** 只在主线程调用 ***
+        原来这里写的是 `self.win.after(0, ...)`，注释还说「任何线程都能调」——
+        那句注释是错的，也是危险的：它把「后台线程碰 Tk 没关系」变成了
+        看起来理所当然的事。实际调用点（__init__ / _on_star /
+        _toggle_only_live）全都在主线程，没有任何理由绕一圈。
+        后台线程想刷新的话，写个标志让 _poll 去处理（见 _poll_bookmark_done）。
+        """
+        try:
+            self._rebuild_bookmarks_ui()
+        except Exception:
+            pass
+
+    def _rebuild_bookmarks_ui(self) -> None:
+        if not self._ready:
+            return
+        for w in self._bm_inner.winfo_children():
+            w.destroy()
+        self._bm_cards.clear()
+
+        items = self.store.all() if self.store else []
+        # 排序：开播的排最前（用户最想点的是正在播的），未开播次之，
+        # 「状态未知」排最后 —— 未知说明还没查到，不该排在已知未开播的前面。
+        # 同一档内按收藏时间倒序（最近收藏的靠前）。
+        # 注意走 _live_of：直接 `live_status or -1` 会把 0 也当成未知。
+        def _rank(it):
+            ls = self._live_of(it)
+            return (0 if ls == 1 else 1 if ls == 0 else 2,
+                    -float(it.get("added_at") or 0))
+        items.sort(key=_rank)
+        if self._bm_only_live:
+            items = [it for it in items if self._live_of(it) == 1]
+
+        all_items = self.store.all() if self.store else []
+        live_n = sum(1 for it in all_items if self._live_of(it) == 1)
+        total = len(all_items)
+        self.lbl_bm_count.config(text=f"{live_n}/{total} 开播" if total else "")
+
+        if not items:
+            # 每次新建，不缓存引用（见 _build_bookmarks 里的说明）
+            tip = ("没有正在开播的收藏" if self._bm_only_live and total
+                   else "还没有收藏。\n播放时点封面上的 ☆ 收藏当前直播间。")
+            tk.Label(self._bm_inner, text=tip, bg=_BG, fg=_FG_FAINT,
+                     font=(_UI_FONT, 9), justify="left").pack(
+                         anchor="w", padx=6, pady=(8, 0))
+            self._bm_canvas.configure(scrollregion=(0, 0, 0, 0))
+            return
+
+        for i, it in enumerate(items):
+            self._make_bm_card(self._bm_inner, it, i // 2, i % 2)
+        self._bm_inner.update_idletasks()
+        self._bm_canvas.configure(
+            scrollregion=self._bm_canvas.bbox("all"))
+
+    @staticmethod
+    def _live_of(item) -> int:
+        """取 live_status：1 开播 / 0 未开播 / -1 未知。
+
+        *** 不能用 `item.get("live_status") or -1` ***
+        0 是 falsy，`0 or -1` 得到 -1 —— 于是「未开播」会被显示成
+        「状态未知」，而且排序也把未开播排到了未知的后面。
+        实测踩到：明明存的是 0，卡片上却是「? 状态未知」。
+        必须显式判 None。
+        """
+        v = item.get("live_status")
+        if v is None:
+            return -1
+        try:
+            return int(v)
+        except Exception:
+            return -1
+
+    def _make_bm_card(self, parent, item, r: int, c: int) -> None:
+        """画一张收藏卡片：封面 + 主播名 + 房间号 + 标题前几位。"""
+        rid = int(item["room_id"])
+        live = self._live_of(item)
+        card = tk.Frame(parent, bg=_CARD)
+        card.grid(row=r, column=c, sticky="nsew", padx=(0, 8), pady=(0, 8))
+
+        top = tk.Frame(card, bg=_CARD)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+
+        # 封面。用 Canvas + create_image，这样图片能精确贴边。
+        sz = self.COVER_CARD
+        cv = tk.Canvas(top, width=sz, height=sz, bg=_CARD_HI,
+                       highlightthickness=0, bd=0)
+        cv.pack(side="left")
+        # 开播状态点也画在封面上（左上角），比单独一行标签省地方
+        dot = _ACCENT if live == 1 else (_LINE if live == 0 else _FG_FAINT)
+        cv.create_oval(3, 3, 11, 11, fill=dot, outline=_CARD, width=1)
+
+        txt = tk.Frame(top, bg=_CARD)
+        txt.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        # 房间号单独一行、用次要色：它是精确标识，用户要拿去核对
+        tk.Label(txt, text=str(rid), bg=_CARD, fg=_ACCENT,
+                 font=(_UI_FONT, 8, "bold"), anchor="w").pack(anchor="w")
+        uname = (item.get("uname") or "").strip() or "（未知主播）"
+        lb_u = tk.Label(txt, text=self._clip(uname, 9), bg=_CARD, fg=_FG,
+                        font=(_UI_FONT, 9), anchor="w")
+        lb_u.pack(anchor="w")
+        title = (item.get("title") or "").strip() or "—"
+        lb_t = tk.Label(txt, text=self._clip(title, 11), bg=_CARD, fg=_FG_DIM,
+                        font=(_UI_FONT, 8), anchor="w")
+        lb_t.pack(anchor="w")
+
+        # 底部一行：开播状态文字
+        if live == 1:
+            stat, sc = "● 正在直播", _ACCENT
+        elif live == 0:
+            stat, sc = "○ 未开播", _FG_FAINT
+        else:
+            stat, sc = "? 状态未知", _FG_FAINT
+        lb_s = tk.Label(card, text=stat, bg=_CARD, fg=sc,
+                        font=(_UI_FONT, 8), anchor="w")
+        lb_s.pack(anchor="w", padx=8, pady=(0, 8))
+
+        widgets = [card, top, cv, txt, lb_u, lb_t, lb_s]
+        for w in widgets:
+            w.bind("<Button-1>", lambda e, x=rid: self.play_bookmark(x))
+            w.bind("<Enter>", lambda e, cc=card: self._bm_hover(cc, True))
+            w.bind("<Leave>", lambda e, cc=card: self._bm_hover(cc, False))
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+
+        self._bm_cards[rid] = {"card": card, "canvas": cv, "stat": lb_s,
+                               "uname": lb_u, "title": lb_t, "cover": None}
+        # 异步取封面图
+        self.load_cover(item.get("cover") or "", self.COVER_CARD,
+                        lambda img, rid=rid: self._set_card_cover(rid, img))
+
+    @staticmethod
+    def _bm_hover(card, on: bool) -> None:
+        """悬停时整张卡片换底色。只改 card 自己，子控件保持 _CARD 会突兀，
+        所以子控件也跟着换 —— 用遍历而不是逐个记录，免得漏掉。"""
+        want = _CARD_HI if on else _CARD
+        stack = [card]
+        while stack:
+            w = stack.pop()
+            try:
+                if w.cget("bg") in (_CARD, _CARD_HI):
+                    w.configure(bg=want)
+            except Exception:
+                pass
+            try:
+                stack.extend(w.winfo_children())
+            except Exception:
+                pass
+
+    @staticmethod
+    def _clip(text: str, n: int) -> str:
+        """截断长标题。用省略号而不是硬切，让用户知道后面还有内容。"""
+        t = " ".join(str(text).split())
+        return t if len(t) <= n else t[:n] + "…"
+
+    def _set_card_cover(self, rid: int, img) -> None:
+        entry = self._bm_cards.get(int(rid))
+        if not entry or img is None:
+            return
+        try:
+            entry["canvas"].delete("cover")
+            entry["canvas"].create_image(0, 0, anchor="nw", image=img,
+                                         tags="cover")
+            entry["cover"] = img          # 留引用，别被回收
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 封面下载
+
+    def load_cover(self, url: str, size: int, cb) -> None:
+        """异步取封面并缩放到 size×size，然后回调 cb(PhotoImage)。
+
+        **必须在后台线程下载**：封面虽然只有 1.5 KB，但建连 + 图床响应
+        实测要 1~5 秒。放主线程会把界面冻住。
+
+        *** 后台线程不碰 Tk ***
+        下载完只把结果塞进 _img_ready/_img_wait 队列，由主线程的
+        _poll_covers() 取出来创建 PhotoImage 并回调。
+        第一版在后台线程里调 self.win.after(0, finish)，那是跨线程碰 Tk ——
+        已经因此吃过一次工作线程卡死（见 refresh_bookmarks 的说明）。
+        """
+        if not url or not _HAS_PIL:
+            return
+        key = (url, size)
+        with self._img_lock:
+            if self._img_cache.get(key) is not None:
+                # 已经下过：直接挂进队列，主线程下一轮 _poll_covers 就回调
+                self._img_wait.append((key, cb))
+                return
+            # 同一张图正在下载，或还没开始 —— 都只是把回调挂上去。
+            # 已经在下的话不重复起线程。
+            self._img_wait.append((key, cb))
+            if key in self._img_pending:
+                return
+            self._img_pending.add(key)
+
+        def worker():
+            img = None
+            try:
+                # 图床支持用 @宽_高 要缩略图：121 KB -> 1.5 KB，省 82 倍。
+                # 部分老封面不认这个参数，那就退回原图自己缩。
+                for u in (url + self._THUMB % (size, size), url):
+                    try:
+                        req = urllib.request.Request(
+                            u, headers={"User-Agent": "Mozilla/5.0",
+                                        "Referer": "https://live.bilibili.com/"})
+                        with urllib.request.urlopen(req, timeout=12) as r:
+                            data = r.read(3 * 1024 * 1024)
+                        im = Image.open(io.BytesIO(data))
+                        im.load()
+                        img = im.convert("RGB")
+                        break
+                    except Exception:
+                        continue
+                if img is None:
+                    return
+                # 正方裁切（封面是 16:9，直接缩小会变形）
+                w, h = img.size
+                m = min(w, h)
+                img = img.crop(((w - m) // 2, (h - m) // 2,
+                                (w - m) // 2 + m, (h - m) // 2 + m))
+                img = img.resize((size, size), Image.LANCZOS)
+            except Exception:
+                img = None
+            finally:
+                with self._img_lock:
+                    self._img_pending.discard(key)
+            if img is not None:
+                # 只写共享变量：Image 对象本身是安全的，
+                # 需要主线程做的只有「创建 PhotoImage」这一步。
+                with self._img_lock:
+                    self._img_decoded[key] = img
+
+        threading.Thread(target=worker, name="cover", daemon=True).start()
+
+    def _poll_covers(self) -> None:
+        """主线程轮询：把下载好的图变成 PhotoImage 并回调。由 _poll 调用。
+
+        这里只做三件事，保持简单：
+          1. 把后台刚解码好的图（_img_decoded）转成 PhotoImage 存进缓存
+          2. 对缓存里已经有的，取出对应的等待回调并执行
+          3. 还没好的留在队列里等下一轮
+        """
+        if not getattr(self, "_img_wait", None):
+            return
+        with self._img_lock:
+            decoded = dict(self._img_decoded)
+            self._img_decoded.clear()
+            waits = list(self._img_wait)
+        # 1. 先在主线程创建 PhotoImage（这一步只能在主线程做）
+        for key, im in decoded.items():
+            try:
+                with self._img_lock:
+                    self._img_cache[key] = ImageTk.PhotoImage(im)
+            except Exception:
+                pass
+        # 2/3. 能兑现的回调就执行，其余留到下一轮
+        still, fire = [], []
+        with self._img_lock:
+            for key, cb in waits:
+                ph = self._img_cache.get(key)
+                if ph is not None:
+                    fire.append((cb, ph))
+                else:
+                    still.append((key, cb))
+            self._img_wait = still
+        for cb, ph in fire:
+            try:
+                cb(ph)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ 收藏操作
+
+    def _on_star(self) -> None:
+        """点黄星：收藏/取消收藏当前正在听的直播间。"""
+        rid = self._room_now or self.control.room
+        try:
+            rid = int(rid) if rid else None
+        except Exception:
+            rid = None
+        if not rid:
+            # 没有正在听的房间，星标没有意义 —— 给个明确反馈而不是静默
+            self.toast("先开始收听一个直播间，才能收藏它", kind="offline")
+            return
+        if self.store is None:
+            self.toast("收藏功能不可用（配置目录不可写）", kind="error")
+            return
+        saved = self.store.toggle(
+            rid,
+            uname=self.control.anchor or "",
+            title=self.control.title or "",
+            cover=self.control.cover or "",
+            # 正在出声就是开播中。不能默认 -1，否则刚收藏的直播间
+            # 会显示成「状态未知」直到下次刷新。
+            live_status=1 if self.control.playing else None,
+        )
+        self._star_on = None            # 强制重画
+        self._draw_star()
+        self.rebuild_bookmarks()
+        self.toast(f"已收藏 {self.control.anchor or rid}" if saved
+                   else f"已取消收藏 {self.control.anchor or rid}",
+                   kind="offline", ms=2600)
+
+    def _draw_star(self, hover: bool = False) -> None:
+        """画收藏星标。已收藏=实心金黄，未收藏=空心灰。"""
+        rid = self._room_now or self.control.room
+        on = bool(self.store and self.store.has(rid)) if self.store else False
+        if self._star_on == on and not hover:
+            return
+        self._star_on = on
+        c = self.btn_star
+        c.delete("all")
+        # 星形顶点：外半径/内半径交替 10 个点
+        import math
+        cx = cy = 13.0
+        col = "#ffc53d" if on else (_FG if hover else _FG_FAINT)
+        pts = []
+        for i in range(10):
+            r = 9.0 if i % 2 == 0 else 3.9
+            a = -math.pi / 2 + i * math.pi / 5
+            pts.extend((cx + r * math.cos(a), cy + r * math.sin(a)))
+        if on:
+            c.create_polygon(pts, fill=col, outline="#c99a20", width=1)
+        else:
+            c.create_polygon(pts, fill=_CARD, outline=col, width=2)
+
+    def play_bookmark(self, rid: int) -> None:
+        """点收藏卡片 -> 直接开始听这个房间。"""
+        self._room_var.set(str(rid))
+        self._on_start()
+
+    # ------------------------------------------------------------ 开播状态
+
+    def refresh_bookmarks(self, auto: bool = False) -> None:
+        """查一遍所有收藏的开播状态。auto=True 表示是启动时自动查的。
+
+        *** 线程规则：后台线程只查网络 + 写 store，绝不碰 Tk ***
+        第一版在 check_live 的 on_one 回调里调了 self.win.after(0, ...) 想逐条
+        更新界面，结果**工作线程卡死在第一间房之后**（实测：check_live 打印
+        「开始」就再没打印「结束」，_bm_refreshing 永远是 True，按钮一直
+        「刷新中…」）。Tk 不是线程安全的，从后台线程调 after 会出这种事。
+        现在改成：后台跑完再排一次界面重画，全程不在后台碰 Tk。
+        """
+        if self._bm_refreshing:
+            return
+        if self.store is None or len(self.store) == 0:
+            if not auto:
+                self.toast("还没有收藏，先收藏一个直播间吧", kind="offline",
+                           ms=2600)
+            return
+        self._bm_refreshing = True
+        self.btn_refresh.config(text="刷新中…", fg=_FG_FAINT)
+        ids = [int(it["room_id"]) for it in self.store.all()]
+
+        # 整体超时基准。定义在 worker 之前，避免读起来像「先用后定义」。
+        t_start = time.time()
+
+        def _deadline_passed() -> bool:
+            return time.time() - t_start > 30.0
+
+        def worker():
+            """后台：只做网络请求和写盘。
+
+            *** 绝不调用任何 Tk 方法，连 win.after() 也不调 ***
+            第一版在这里调 self.win.after(0, ...) 把结果送回主线程，结果
+            工作线程卡死在第一间房之后（实测：check_live 打了「开始」就再没
+            打「结束」，按钮永远停在「刷新中…」）。
+            Tk 不是线程安全的，从后台线程调 after 会出这种事 ——
+            我在测试脚本里犯同一个错时，脚本直接把整个进程挂死了。
+            现在的做法是「后台只写共享变量，主线程轮询取结果」，
+            也就是本项目 control 对象一直在用的模式。
+            """
+            result = {}
+            try:
+                from .bookmarks import check_live
+                # 单次请求 6 秒、整体 30 秒封顶。收藏多或网络差时宁可少查几个，
+                # 也不能让「刷新中」无限转下去。
+                result = check_live(ids, timeout=6.0,
+                                    should_stop=_deadline_passed)
+            except Exception:
+                result = {}
+            for rid, info in result.items():
+                try:
+                    self.store.update_meta(
+                        rid, uname=info.get("uname", ""),
+                        title=info.get("title", ""),
+                        cover=info.get("cover", ""),
+                        live_status=info.get("live_status"))
+                except Exception:
+                    pass
+            # 只写变量。主线程在 _poll_bookmark_done() 里取。
+            self._bm_result = result
+            self._bm_auto = auto
+            self._bm_done = True
+
+        threading.Thread(target=worker, name="bm-live", daemon=True).start()
+
+    def _poll_bookmark_done(self) -> None:
+        """主线程轮询：后台刷新完了就收尾。由 _poll 每 200ms 调一次。"""
+        if not getattr(self, "_bm_done", False):
+            return
+        self._bm_done = False
+        result = self._bm_result or {}
+        self._bm_result = {}
+        auto = self._bm_auto
+        self._bm_auto = False
+        self._refreshing_done(result, auto)
+
+    def _refreshing_done(self, result: dict, auto: bool) -> None:
+        """刷新收尾。只在主线程执行。"""
+        self._bm_refreshing = False
+        try:
+            self.btn_refresh.config(text="刷新状态", fg=_FG)
+        except Exception:
+            pass
+        self._rebuild_bookmarks_ui()
+        if auto and result:
+            live_n = sum(1 for it in self.store.all()
+                         if self._live_of(it) == 1)
+            if live_n:
+                self.toast(f"收藏里有 {live_n} 个直播间正在开播",
+                           kind="offline", ms=3200)
 
     def _center_full(self, reposition: bool = True) -> None:
         """按内容定尺寸并居中。
@@ -575,9 +1176,16 @@ class Overlay:
         结果窗口窄的时候文字**溢出被裁**，而不是换行：
         迷你窗只有 250 宽，却用 372 的换行宽度，于是
         「播放中 0.1 分钟」尾巴被切掉，看起来像一直停在「正在连接」。
-        留 60px 余量给左右内边距和滚动条余量。
+
+        *** 加了收藏栏之后又要改一次 ***
+        原来传进来的是**整窗宽度**，但左侧那一列只占
+        「整窗 - 收藏栏宽度 - 分隔线 - 左右内边距」。继续按整窗算的话，
+        状态文字和标题的换行点会跑到收藏栏底下，文字被裁。
+        所以这里先扣掉右侧那部分。min() 兜住窗口被压得极窄的情况。
         """
-        wrap = max(120, width - 60)
+        # 扣掉：收藏栏 + 分隔线(padx 6) + 1 + 左列左右内边距(24+16)
+        left = max(180, width - self._SIDE_W - 7 - 40)
+        wrap = max(120, left - 20)
         for lbl in (getattr(self, "lbl_status", None),
                     getattr(self, "lbl_title", None)):
             if lbl is not None:
@@ -1034,9 +1642,16 @@ class Overlay:
     def _refresh_meta(self) -> None:
         anchor = (self.control.anchor or "").strip()
         title = (self.control.title or "").strip()
-        if anchor == self._last_anchor and title == self._last_title:
+        cover = (self.control.cover or "").strip()
+        if (anchor == self._last_anchor and title == self._last_title
+                and cover == self._last_cover):
             return
         self._last_anchor, self._last_title = anchor, title
+        self._last_cover = cover
+        # 星标状态可能因为「换房间」而变化（新房间可能不在收藏里），
+        # 所以跟着主播信息一起重画
+        self._star_on = None
+        self._draw_star()
 
         if not anchor and not title:
             # *** 没有信息时必须把旧的清掉 ***
@@ -1045,6 +1660,8 @@ class Overlay:
             # 用户会以为没换成功。实测踩过：换台后仍显示旧主播名。
             self.lbl_anchor.config(text="")
             self.lbl_title.config(text="")
+            self._cover_shown = None
+            self._paint_cover(None)         # 封面也要清掉，别留着上一个房间的
             if self.meta.winfo_ismapped():
                 self.meta.pack_forget()
                 # 撤掉那一块后窗口要重新收一下高度
@@ -1053,12 +1670,20 @@ class Overlay:
 
         self.lbl_anchor.config(text=anchor or "（未取名）")
         self.lbl_title.config(text=title or "")
+        # 封面：只有 URL 变了才重新下载，否则每 200ms 轮询都会重下
+        if cover and cover != self._cover_shown:
+            self._cover_shown = cover
+            self.load_cover(cover, self.COVER_MAIN, self._paint_cover)
+        elif not cover:
+            self._cover_shown = None
+            self._paint_cover(None)
         if not self.meta.winfo_ismapped():
             # 插到「地址栏提示」之下、「音量」之上：
             # 顺序上是「你输入的房间 -> 这个房间是谁 -> 音量 -> 状态」。
             # before= 需要一个已存在的兄弟控件，这里用 vrow（音量那行的容器），
             # 它是 _build_full 里显式保存下来的，比靠遍历 winfo_children 稳。
-            self.meta.pack(fill="x", padx=24, pady=(12, 0), before=self._vrow)
+            self.meta.pack(fill="x", padx=(24, 16), pady=(12, 0),
+                           before=self._vrow)
             # *** 出现新内容后必须重新调一次尺寸 ***
             # 否则窗口高度还是旧的，多出来的文字会把底部按钮挤出去（实测踩过：
             # 状态文字叠在「开始收听」上）。reposition=False 保持窗口不跳。
@@ -1067,9 +1692,40 @@ class Overlay:
             # 迷你窗标题也带上主播名，同时开多个房间时好区分
             self.lbl_mini.config(text=f"bililive  {anchor}")
 
+    def _paint_cover(self, img) -> None:
+        """把封面画到主界面的 Canvas 上。img 为 None 时画占位。"""
+        cv = self.COVER_MAIN
+        try:
+            self.cv_cover.delete("all")
+            if img is None:
+                # 占位：一个居中的音符符号，明确表示「这里本该有封面」
+                self.cv_cover.create_rectangle(0, 0, cv, cv, fill=_CARD,
+                                               outline="")
+                self.cv_cover.create_text(cv / 2, cv / 2, text="♪",
+                                          fill=_FG_FAINT,
+                                          font=(_UI_FONT, 20))
+            else:
+                self.cv_cover.create_image(0, 0, anchor="nw", image=img)
+                # *** 必须留引用 ***
+                # PhotoImage 被回收后 Canvas 上会变空白，这是 Tkinter 的经典坑。
+                self._cover_main_img = img
+        except Exception:
+            pass
+
     def _poll(self) -> None:
+        """主线程的 200ms 心跳。所有跨线程而来的结果都在这里取。"""
         try:
             self._refresh()
+        except Exception:
+            pass
+        # 后台下载好的封面（只在这里创建 PhotoImage，Tk 才安全）
+        try:
+            self._poll_covers()
+        except Exception:
+            pass
+        # 后台刷新好的开播状态
+        try:
+            self._poll_bookmark_done()
         except Exception:
             pass
         try:

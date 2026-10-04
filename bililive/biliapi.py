@@ -244,6 +244,27 @@ class BiliLiveClient:
             pass
         return {}
 
+    def room_meta(self, room: int) -> dict:
+        """一次拿到「真实 room_id + 开播状态 + 主播名 + 标题 + 封面」。
+
+        收藏列表刷新开播状态用这个：短号也要能查（收藏里可能存了短号），
+        而 room_init 才负责短号 -> 真实 room_id 的换算。
+
+        房间不存在时抛 BiliApiError（调用方据此区分「房间没了」和「查不到」）。
+        拿不到 title/uname/cover 不算错 —— 未开播的直播间也可能没有封面。
+        """
+        info = self.resolve_room(room)
+        rid = int(info.get("room_id") or room)
+        meta = self.room_info(rid) or {}
+        return {
+            "room_id": rid,
+            "live_status": info.get("live_status"),
+            "uname": str(meta.get("uname") or ""),
+            "title": str(meta.get("title") or ""),
+            # 这个字段名容易看漏：getRoomBaseInfo 里叫 cover，不是 user_cover
+            "cover": str(meta.get("cover") or ""),
+        }
+
     def audio_streams(self, room_id: int, qn: int = 10000) -> list[AudioStream]:
         """拿纯音频流。只请求 http_stream/flv —— 实测这是唯一稳定给纯音频的组合。
 

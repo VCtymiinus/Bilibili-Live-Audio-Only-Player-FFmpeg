@@ -80,6 +80,9 @@ class PlayerControl:
         # 取不到就一直是空串，界面据此决定显不显示那一块。
         self.anchor = ""
         self.title = ""
+        # 直播间封面图 URL。字段名是 cover（getRoomBaseInfo 里就叫这个，
+        # 不是 user_cover）—— 界面据此显示封面，并在收藏时存进快照。
+        self.cover = ""
 
         # ---- 给界面的错误提示通道 ----
         # *** 为什么必须有这个 ***
